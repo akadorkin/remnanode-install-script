@@ -2,15 +2,10 @@
 set -euo pipefail
 
 # tailscale-setup.sh
-# Extracted from your old "working" script:
-# - sysctl forwarding + rp_filter
-# - enable GRO + rx-udp-gro-forwarding (best-effort)
-# - install tailscale (if missing) with official install.sh (log to file)
-# - run `tailscale up --advertise-exit-node --ssh`, print auth URL if present
-# - wait for Enter, then show tailscale IPv4
-#
-# Note: this script keeps the original behavior (Enter wait, URL extraction).
-# It does NOT try to be "smart" beyond that; it mirrors the old logic.
+# Extracted from your old "working" script + fixes:
+# - ensure tailscaled is enabled+started (so it survives reboot)
+# - if no /dev/tty (running via pipe/CI), don't hang on Enter:
+#   print auth URL (if any) and wait a bit for IPv4 to appear.
 
 # ------------- OUTPUT HELPERS (same style as old) -------------
 log() { echo -e "\033[1;36m==>\033[0m $*"; }
@@ -30,7 +25,16 @@ runq(){
 }
 
 require_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { err "Run as root"; exit 1; }; }
-read_tty(){ local __var="$1" __prompt="$2" __v=""; read -rp "$__prompt" __v </dev/tty || true; printf -v "$__var" '%s' "$__v"; }
+
+read_tty(){
+  local __var="$1" __prompt="$2" __v=""
+  if [[ -e /dev/tty ]]; then
+    read -rp "$__prompt" __v </dev/tty || true
+  else
+    __v=""
+  fi
+  printf -v "$__var" '%s' "$__v"
+}
 
 require_root
 export DEBIAN_FRONTEND=noninteractive
@@ -38,15 +42,39 @@ export DEBIAN_FRONTEND=noninteractive
 # ------------- CONFIG -------------
 TAILSCALE_LOG="/var/log/install-tailscale.log"
 SYSCTL_FILE="/etc/sysctl.d/99-tailscale-forwarding.conf"
+UP_LOG="/tmp/tailscale-up.log"
 
 # ------------- HELPERS -------------
+has_tty() { [[ -e /dev/tty ]]; }
+
 get_default_iface() {
-  # matches your old script (simple)
   ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true
 }
 
 tailscale_ip4() {
-  tailscale ip -4 2>/dev/null || true
+  command -v tailscale >/dev/null 2>&1 || return 0
+  tailscale ip -4 2>/dev/null | head -n1 || true
+}
+
+ensure_tailscaled_running() {
+  # Make tailscale survive reboot.
+  if command -v systemctl >/dev/null 2>&1; then
+    # do not fail hard here
+    systemctl enable --now tailscaled >/dev/null 2>&1 || systemctl enable --now tailscale >/dev/null 2>&1 || true
+  fi
+}
+
+wait_for_ip() {
+  local max="${1:-90}" i ip=""
+  for ((i=0; i<max; i++)); do
+    ip="$(tailscale_ip4)"
+    if [[ -n "${ip:-}" ]]; then
+      echo "$ip"
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
 }
 
 # ------------- MAIN -------------
@@ -64,8 +92,8 @@ runq "sysctl --system" sysctl --system
 INTERNET_IFACE="$(get_default_iface)"
 if [[ -n "${INTERNET_IFACE:-}" ]]; then
   if command -v ethtool >/dev/null 2>&1; then
-    runq "ethtool gro on"              ethtool -K "${INTERNET_IFACE}" gro on || true
-    runq "ethtool rx-udp-gro-fwd on"   ethtool -K "${INTERNET_IFACE}" rx-udp-gro-forwarding on || true
+    runq "ethtool gro on"            ethtool -K "${INTERNET_IFACE}" gro on || true
+    runq "ethtool rx-udp-gro-fwd on" ethtool -K "${INTERNET_IFACE}" rx-udp-gro-forwarding on || true
   else
     warn "ethtool not installed — skipping GRO tweaks"
   fi
@@ -76,18 +104,19 @@ fi
 :> "$TAILSCALE_LOG"
 if ! command -v tailscale >/dev/null 2>&1; then
   log "Installing tailscale"
-  # exactly as in old script: install.sh -> sh, log to file
   runq "install tailscale" bash -lc "curl -fsSL https://tailscale.com/install.sh | sh >>'$TAILSCALE_LOG' 2>&1"
 else
   ok "tailscale already installed — skipping"
 fi
 
+ensure_tailscaled_running
+
 log "Running tailscale up (waiting for auth)"
 set +e
-tailscale up --advertise-exit-node --ssh | tee /tmp/tailscale-up.log
+tailscale up --advertise-exit-node --ssh 2>&1 | tee "$UP_LOG"
 set -e
 
-TAILSCALE_URL="$(grep -Eo 'https://login\.tailscale\.com/[a-zA-Z0-9/_-]+' /tmp/tailscale-up.log | head -n1 || true)"
+TAILSCALE_URL="$(grep -Eo 'https://login\.tailscale\.com/[a-zA-Z0-9/_-]+' "$UP_LOG" | head -n1 || true)"
 if [[ -n "$TAILSCALE_URL" ]]; then
   echo "🔗 Open to authorize: $TAILSCALE_URL"
 else
@@ -96,13 +125,25 @@ else
   echo "   tailscale up --advertise-exit-node --ssh"
 fi
 
-read_tty _ "Press Enter after authorizing this device in Tailscale… "
+if has_tty; then
+  read_tty _ "Press Enter after authorizing this device in Tailscale… "
+  TS_IP="$(tailscale_ip4)"
+else
+  warn "No /dev/tty — won't wait for Enter. Waiting up to 90s for IPv4…"
+  TS_IP="$(wait_for_ip 90 || true)"
+fi
 
-TS_IP="$(tailscale_ip4)"
-echo "🧅  Tailscale IPv4: ${TS_IP:-not assigned}"
+if [[ -n "${TS_IP:-}" ]]; then
+  echo "🧅  Tailscale IPv4: ${TS_IP}"
+else
+  echo "🧅  Tailscale IPv4: not assigned"
+  echo "Hint:"
+  echo "  - check daemon: systemctl status tailscaled"
+  echo "  - re-run: tailscale up --advertise-exit-node --ssh"
+fi
 
 echo
 echo "Done."
 echo "Logs:"
 echo "  • Tailscale install: $TAILSCALE_LOG"
-echo "  • tailscale up:      /tmp/tailscale-up.log"
+echo "  • tailscale up:      $UP_LOG"
