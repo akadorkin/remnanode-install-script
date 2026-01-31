@@ -658,25 +658,32 @@ dns_apply() {
   echo "  - /etc/dns-switcher-backup"
 }
 
+
 ###############################################################################
-# Tailscale (idempotent; must end with a working IPv4 on tailscale0)
+# Tailscale (quiet; idempotent; must end with a working IPv4 on tailscale0)
+# - If tailscale0 exists but has no IPv4 -> purge + reinstall via install.sh
+# - Always prints auth URL (via tailscale login) and waits for Enter on /dev/tty
 ###############################################################################
 tailscale_install_if_needed() {
+  : >"$TS_LOG" 2>/dev/null || true
+
   if command -v tailscale >/dev/null 2>&1; then
     ok "tailscale already installed"
     return 0
   fi
-  : >"$TS_LOG" || true
+
   if curl -fsSL https://tailscale.com/install.sh | sh >>"$TS_LOG" 2>&1; then
     ok "tailscale installed"
-  else
-    warn "tailscale install failed (see $TS_LOG)"
+    return 0
   fi
+
+  warn "tailscale install failed (see $TS_LOG)"
+  return 1
 }
 
 tailscale_restart_daemon() {
-  systemctl enable --now tailscaled >/dev/null 2>&1 || true
-  systemctl restart tailscaled >/dev/null 2>&1 || true
+  systemctl enable --now tailscaled >>"$TS_LOG" 2>&1 || true
+  systemctl restart tailscaled >>"$TS_LOG" 2>&1 || true
 }
 
 tailscale_sysctl_tune() {
@@ -686,13 +693,13 @@ net.ipv6.conf.all.forwarding=1
 net.ipv4.conf.all.rp_filter=0
 net.ipv4.conf.default.rp_filter=0
 EOF
-  sysctl --system >/dev/null 2>&1 || true
+  sysctl --system >>"$TS_LOG" 2>&1 || true
 
   local internet_iface=""
   internet_iface="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)"
-  if [[ -n "$internet_iface" ]] && command -v ethtool >/dev/null 2>&1; then
-    ethtool -K "$internet_iface" gro on >/dev/null 2>&1 || true
-    ethtool -K "$internet_iface" rx-udp-gro-forwarding on >/dev/null 2>&1 || true
+  if [[ -n "${internet_iface:-}" ]] && command -v ethtool >/dev/null 2>&1; then
+    ethtool -K "$internet_iface" gro on >>"$TS_LOG" 2>&1 || true
+    ethtool -K "$internet_iface" rx-udp-gro-forwarding on >>"$TS_LOG" 2>&1 || true
   fi
 }
 
@@ -708,22 +715,19 @@ tailscale_magicdns_name() {
   echo "$name"
 }
 
-tailscale_is_up() {
-  tailscale status >/dev/null 2>&1
-}
-
-tailscale_ip4() {
-  tailscale ip -4 2>/dev/null | head -n1 || true
-}
+tailscale_is_up() { tailscale status >/dev/null 2>&1; }
+tailscale_ip4() { tailscale ip -4 2>/dev/null | head -n1 || true; }
 
 tailscale_iface_has_ipv4() {
   ip -4 addr show dev tailscale0 2>/dev/null | grep -qE '\binet\s' && return 0
   return 1
 }
 
+tailscale0_present() { ip link show tailscale0 >/dev/null 2>&1; }
+
 tailscale_need_reinstall() {
-  # Your signal: tailscale0 exists, but only has IPv6 link-local (no IPv4).
-  if ip link show tailscale0 >/dev/null 2>&1; then
+  # broken signature: tailscale0 exists but has only IPv6 link-local (no IPv4)
+  if tailscale0_present; then
     if ! tailscale_iface_has_ipv4; then
       return 0
     fi
@@ -735,38 +739,44 @@ tailscale_reinstall_if_broken() {
   if ! tailscale_need_reinstall; then
     return 0
   fi
+
   warn "tailscale0 has no IPv4 (looks broken) -> reinstalling tailscale first"
-  : >"$TS_LOG" || true
-  aptq "Reinstall tailscale" install --reinstall tailscale || true
+  : >"$TS_LOG" 2>/dev/null || true
+
+  # Best-effort stop and purge
+  systemctl stop tailscaled >>"$TS_LOG" 2>&1 || true
+
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get -y -qq -o Dpkg::Use-Pty=0 remove --purge tailscale >>"$TS_LOG" 2>&1 || true
+    rm -f /etc/apt/sources.list.d/tailscale.list /etc/apt/keyrings/tailscale.gpg >>"$TS_LOG" 2>&1 || true
+    apt-get -y -qq -o Dpkg::Use-Pty=0 update >>"$TS_LOG" 2>&1 || true
+  fi
+
+  rm -rf /var/lib/tailscale /var/cache/tailscale >>"$TS_LOG" 2>&1 || true
+
+  if curl -fsSL https://tailscale.com/install.sh | sh >>"$TS_LOG" 2>&1; then
+    ok "Reinstall tailscale"
+  else
+    warn "Reinstall tailscale failed (see $TS_LOG)"
+  fi
+
   tailscale_restart_daemon
 }
 
-tailscale_up_with_auth() {
-  : >"$TS_LOG" || true
-  local out="/tmp/vps-edge-tailscale-up.log"
-  rm -f "$out" 2>/dev/null || true
-
-  # Force fresh login flow so we reliably get an auth URL.
+tailscale_print_auth_url_and_wait() {
+  # Make URL flow reliable:
+  # - logout first, then login (prints URL), then wait for Enter
   tailscale logout >>"$TS_LOG" 2>&1 || true
 
+  local out="/tmp/vps-edge-tailscale-login.log"
+  rm -f "$out" 2>/dev/null || true
+
   set +e
-  tailscale up --ssh 2>&1 | tee "$out" >>"$TS_LOG"
-  local rc=${PIPESTATUS[0]}
+  tailscale login 2>&1 | tee "$out" >>"$TS_LOG"
   set -e
 
   local url=""
   url="$(grep -Eo 'https://login\.tailscale\.com/[a-zA-Z0-9/_-]+' "$out" | head -n1 || true)"
-
-  # If tailscale up didn't print the URL, tailscale login usually will.
-  if [[ -z "$url" ]]; then
-    rm -f "$out" 2>/dev/null || true
-    set +e
-    tailscale login 2>&1 | tee "$out" >>"$TS_LOG"
-    rc_login=${PIPESTATUS[0]}
-    set -e
-    url="$(grep -Eo 'https://login\.tailscale\.com/[a-zA-Z0-9/_-]+' "$out" | head -n1 || true)"
-    rc=$(( rc == 0 ? rc_login : rc ))
-  fi
 
   if [[ -n "$url" ]]; then
     echo
@@ -778,26 +788,27 @@ tailscale_up_with_auth() {
     else
       warn "No /dev/tty available to wait for confirmation."
     fi
-
-    # After approval, ensure we're up with ssh enabled.
-    set +e
-    tailscale up --ssh >>"$TS_LOG" 2>&1
-    set -e
-  else
-    warn "Could not extract Tailscale auth URL."
-    warn "Try manually: tailscale logout && tailscale login"
+    return 0
   fi
 
-  return "$rc"
+  warn "Auth URL not found in tailscale login output (see $TS_LOG)"
+  return 1
+}
+
+tailscale_up_ssh_quiet() {
+  # After user approval, bring up with ssh enabled
+  tailscale up --ssh >>"$TS_LOG" 2>&1 || true
 }
 
 tailscale_apply() {
   hdr "🧠 Tailscale (early)"
+  : >"$TS_LOG" 2>/dev/null || true
+
   tailscale_install_if_needed
   tailscale_restart_daemon
   tailscale_sysctl_tune
 
-  # If interface exists but is broken -> reinstall first
+  # If interface exists but is broken -> reinstall first (purge+install.sh)
   tailscale_reinstall_if_broken
 
   # If already up and has IPv4 -> OK
@@ -807,11 +818,13 @@ tailscale_apply() {
     [[ -n "$ip" ]] && ok "tailscale is up (ip ${ip})" || ok "tailscale is up"
     name="$(tailscale_magicdns_name)"
     [[ -n "$name" ]] && ok "MagicDNS: ${name}" || warn "MagicDNS name not available (maybe disabled)."
+    TAILSCALE_READY="1"
     return 0
   fi
 
-  # Not up / not healthy -> try tailscale up (with auth URL + confirmation)
-  tailscale_up_with_auth || true
+  # Not up / not healthy -> print auth URL + wait, then up --ssh
+  tailscale_print_auth_url_and_wait || true
+  tailscale_up_ssh_quiet
 
   # Wait for IPv4 on tailscale0 (critical for "SSH over Tailscale must work")
   local ip=""
@@ -825,36 +838,40 @@ tailscale_apply() {
 
   if [[ -n "$ip" ]] && tailscale_iface_has_ipv4; then
     ok "tailscale is up (ip ${ip})"
-  else
-    # last remediation: restart daemon once, wait again
-    warn "tailscale IPv4 not detected yet -> restarting tailscaled and retrying"
-    tailscale_restart_daemon
-    tailscale_up_with_auth || true
-
-    for _i in {1..30}; do
-      ip="$(tailscale_ip4)"
-      if [[ -n "$ip" ]] && tailscale_iface_has_ipv4; then
-        break
-      fi
-      sleep 1
-    done
-
-    if [[ -n "$ip" ]] && tailscale_iface_has_ipv4; then
-      ok "tailscale is up (ip ${ip})"
-    else
-      warn "tailscale still has no IPv4 on tailscale0."
-      warn "This is unsafe to proceed with UFW (can lock you out). We'll skip enabling UFW."
-      TAILSCALE_READY="0"
-      return 0
-    fi
+    local name
+    name="$(tailscale_magicdns_name)"
+    [[ -n "$name" ]] && ok "MagicDNS: ${name}" || warn "MagicDNS name not available (maybe disabled)."
+    TAILSCALE_READY="1"
+    return 0
   fi
 
-  local name
-  name="$(tailscale_magicdns_name)"
-  [[ -n "$name" ]] && ok "MagicDNS: ${name}" || warn "MagicDNS name not available (maybe disabled)."
+  # last remediation: restart once and retry login/up
+  warn "tailscale IPv4 not detected yet -> restarting tailscaled and retrying"
+  tailscale_restart_daemon
+  tailscale_print_auth_url_and_wait || true
+  tailscale_up_ssh_quiet
 
-  TAILSCALE_READY="1"
+  for _i in {1..30}; do
+    ip="$(tailscale_ip4)"
+    if [[ -n "$ip" ]] && tailscale_iface_has_ipv4; then
+      break
+    fi
+    sleep 1
+  done
+
+  if [[ -n "$ip" ]] && tailscale_iface_has_ipv4; then
+    ok "tailscale is up (ip ${ip})"
+    local name
+    name="$(tailscale_magicdns_name)"
+    [[ -n "$name" ]] && ok "MagicDNS: ${name}" || warn "MagicDNS name not available (maybe disabled)."
+    TAILSCALE_READY="1"
+  else
+    warn "tailscale still has no IPv4 on tailscale0."
+    warn "This is unsafe to proceed with UFW (can lock you out). We'll skip enabling UFW."
+    TAILSCALE_READY="0"
+  fi
 }
+
 
 ###############################################################################
 # User management
