@@ -1075,28 +1075,46 @@ EOF
 ###############################################################################
 remnanode_collect_inputs_early() {
   local compose="/opt/remnanode/docker-compose.yml"
+
+  # If compose already exists -> skip asking
   if [[ -f "$compose" ]]; then
     ok "remnanode compose exists: ${compose} (skip early inputs)"
     SKIP_REMNANODE_INPUTS="1"
     return 0
   fi
 
+  # If remnanode requested, but no TTY -> fail fast (avoid silent skip)
+  if [[ ! -t 0 ]]; then
+    err "remnanode=1 but no interactive TTY available to ask for NODE_PORT/SECRET_KEY."
+    echo
+    echo "Fix:"
+    echo "  - Run in interactive SSH/console, OR"
+    echo "  - Preseed env vars before running:"
+    echo "      NODE_PORT=2222 SECRET_KEY='...your key...' sudo -E ./vps-edge-run.sh apply --remnanode=1"
+    echo
+    die "Refusing to continue without remnanode inputs."
+  fi
+
   hdr "🧩 remnanode inputs (early)"
+
+  # Ask port (default 2222)
   local port=""
   read_tty port "NODE_PORT for remnanode (default 2222): "
   [[ -n "$port" ]] || port="2222"
   NODE_PORT="$port"
 
-  read_tty_silent SECRET_KEY "Paste SECRET_KEY (input hidden): "
-  if [[ -z "$SECRET_KEY" ]]; then
-    warn "SECRET_KEY empty -> remnanode compose will not be created."
-    SKIP_REMNANODE_INPUTS="1"
-    return 0
+  # Ask secret key (must be non-empty)
+  local key=""
+  read_tty_silent key "Paste SECRET_KEY (input hidden): "
+  if [[ -z "$key" ]]; then
+    die "SECRET_KEY is empty. remnanode=1 requires SECRET_KEY when compose is missing."
   fi
+  SECRET_KEY="$key"
 
   ok "remnanode params collected"
   SKIP_REMNANODE_INPUTS="0"
 }
+
 
 remnanode_apply() {
   hdr "🧩 remnanode"
