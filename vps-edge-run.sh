@@ -4,11 +4,11 @@ set -Eeuo pipefail
 ###############################################################################
 # vps-edge-run.sh
 # - DNS switcher (optional, early)
-# - Tailscale (optional, early; idempotent; no reset)
-# - External kernel/system tuning (calls your tuning script; backup+rollback in that script)
+# - Tailscale (optional, early; idempotent; no auth key; interactive URL flow)
 # - Docker + remnanode (optional; early inputs only if compose missing)
 # - User (optional/interactive) + Zsh stack for all /home/* users + root
-# - UFW: WAN only 443 (+ tailscale UDP 41641 when enabled), Tailscale allow-all, Docker bridges allow-all
+# - Kernel/system tuning (external script call) + our backup+rollback for "edge" changes
+# - UFW: WAN only 443 (optional), Tailscale allow-all, Docker bridges allow-all
 # - iperf3 installed always + systemd server enabled always
 ###############################################################################
 
@@ -66,28 +66,245 @@ need_root() {
 ###############################################################################
 # TTY input helpers
 ###############################################################################
-read_tty() { local __var="$1" __prompt="$2" __v=""; [[ -t 0 ]] || { printf -v "$__var" '%s' ""; return 0; }; read -rp "$__prompt" __v </dev/tty || true; printf -v "$__var" '%s' "$__v"; }
-read_tty_silent() { local __var="$1" __prompt="$2" __v=""; [[ -t 0 ]] || { printf -v "$__var" '%s' ""; return 0; }; read -rsp "$__prompt" __v </dev/tty || true; echo >/dev/tty || true; printf -v "$__var" '%s' "$__v"; }
+read_tty() {
+  local __var="$1" __prompt="$2" __v=""
+  [[ -t 0 ]] || { printf -v "$__var" '%s' ""; return 0; }
+  read -rp "$__prompt" __v </dev/tty || true
+  printf -v "$__var" '%s' "$__v"
+}
+read_tty_silent() {
+  local __var="$1" __prompt="$2" __v=""
+  [[ -t 0 ]] || { printf -v "$__var" '%s' ""; return 0; }
+  read -rsp "$__prompt" __v </dev/tty || true
+  echo >/dev/tty || true
+  printf -v "$__var" '%s' "$__v"
+}
+
+###############################################################################
+# Backup + manifest (for rollback of THIS script's changes)
+###############################################################################
+backup_dir=""
+moved_dir=""
+manifest=""
+
+mkbackup() {
+  local tsd="${BACKUP_TS:-${EDGE_BACKUP_TS:-}}"
+  [[ -n "$tsd" ]] || tsd="$(date +%Y%m%d-%H%M%S)"
+  backup_dir="/root/edge-tuning-backup-${tsd}"
+  moved_dir="${backup_dir}/moved"
+  manifest="${backup_dir}/MANIFEST.tsv"
+  mkdir -p "$backup_dir" "$moved_dir" "${backup_dir}/files"
+  : > "$manifest"
+}
+
+backup_file() {
+  local src="$1"
+  [[ -f "$src" ]] || return 0
+  local rel="${src#/}"
+  local dst="${backup_dir}/files/${rel}"
+  mkdir -p "$(dirname "$dst")"
+  cp -a "$src" "$dst"
+  printf "COPY\t%s\t%s\n" "$src" "$dst" >> "$manifest"
+}
+
+move_aside() {
+  local src="$1"
+  [[ -f "$src" ]] || return 0
+  local rel="${src#/}"
+  local dst="${moved_dir}/${rel}"
+  mkdir -p "$(dirname "$dst")"
+  mv -f "$src" "$dst"
+  printf "MOVE\t%s\t%s\n" "$src" "$dst" >> "$manifest"
+}
+
+restore_manifest() {
+  local bdir="$1"
+  local man="${bdir}/MANIFEST.tsv"
+  [[ -f "$man" ]] || die "Manifest not found: $man"
+
+  while IFS=$'\t' read -r kind a b; do
+    [[ -n "${kind:-}" ]] || continue
+    case "$kind" in
+      COPY)
+        [[ -f "$b" ]] || continue
+        mkdir -p "$(dirname "$a")"
+        cp -a "$b" "$a"
+        ;;
+      MOVE)
+        [[ -f "$b" ]] || continue
+        mkdir -p "$(dirname "$a")"
+        mv -f "$b" "$a"
+        ;;
+    esac
+  done < "$man"
+}
+
+latest_backup_dir() {
+  ls -1dt /root/edge-tuning-backup-* 2>/dev/null | head -n1 || true
+}
+
+###############################################################################
+# Numeric helpers
+###############################################################################
+to_int() { local s="${1:-}"; [[ "$s" =~ ^[0-9]+$ ]] && echo "$s" || echo 0; }
+imax() { local a b; a="$(to_int "${1:-0}")"; b="$(to_int "${2:-0}")"; [[ "$a" -ge "$b" ]] && echo "$a" || echo "$b"; }
+
+###############################################################################
+# Geo/ISP helpers (best-effort)
+###############################################################################
+country_flag() {
+  local cc="${1:-}"
+  cc="${cc^^}"
+  if [[ ! "$cc" =~ ^[A-Z]{2}$ ]]; then
+    printf "🏳️"
+    return 0
+  fi
+
+  awk -v cc="$cc" 'BEGIN{
+    o1 = ord(substr(cc,1,1))
+    o2 = ord(substr(cc,2,1))
+    cp1 = 0x1F1E6 + o1 - 65
+    cp2 = 0x1F1E6 + o2 - 65
+    printf "%c%c", cp1, cp2
+  }
+  function ord(c){ return index("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c)+64 }'
+}
+
+ext_ip() {
+  curl -fsSL --max-time 3 https://api.ipify.org 2>/dev/null \
+    || curl -fsSL --max-time 3 ifconfig.me 2>/dev/null \
+    || true
+}
+
+geo_lookup() {
+  # Outputs: COUNTRY_CODE|COUNTRY|REGION|CITY|ORG
+  command -v jq >/dev/null 2>&1 || { printf "||||"; return 0; }
+  local ip="${1:-}"
+  local out=""
+
+  out="$(curl -fsSL --max-time 3 "https://ipinfo.io/${ip}/json" 2>/dev/null || true)"
+  if [[ -n "$out" ]]; then
+    local cc region city org
+    cc="$(printf "%s" "$out" | jq -r '.country // empty' 2>/dev/null || true)"
+    region="$(printf "%s" "$out" | jq -r '.region // empty' 2>/dev/null || true)"
+    city="$(printf "%s" "$out" | jq -r '.city // empty' 2>/dev/null || true)"
+    org="$(printf "%s" "$out" | jq -r '.org // empty' 2>/dev/null || true)"
+    if [[ -n "$cc" || -n "$city" || -n "$org" ]]; then
+      printf "%s|%s|%s|%s|%s" "${cc:-}" "${cc:-}" "${region:-}" "${city:-}" "${org:-}"
+      return 0
+    fi
+  fi
+
+  out="$(curl -fsSL --max-time 3 "http://ip-api.com/json/${ip}?fields=status,countryCode,country,regionName,city,as,isp,org" 2>/dev/null || true)"
+  if [[ -n "$out" ]]; then
+    local status cc country region city as isp org prov
+    status="$(printf "%s" "$out" | jq -r '.status // empty' 2>/dev/null || true)"
+    if [[ "$status" == "success" ]]; then
+      cc="$(printf "%s" "$out" | jq -r '.countryCode // empty' 2>/dev/null || true)"
+      country="$(printf "%s" "$out" | jq -r '.country // empty' 2>/dev/null || true)"
+      region="$(printf "%s" "$out" | jq -r '.regionName // empty' 2>/dev/null || true)"
+      city="$(printf "%s" "$out" | jq -r '.city // empty' 2>/dev/null || true)"
+      as="$(printf "%s" "$out" | jq -r '.as // empty' 2>/dev/null || true)"
+      isp="$(printf "%s" "$out" | jq -r '.isp // empty' 2>/dev/null || true)"
+      org="$(printf "%s" "$out" | jq -r '.org // empty' 2>/dev/null || true)"
+      prov="$as"; [[ -z "$prov" ]] && prov="$org"; [[ -z "$prov" ]] && prov="$isp"
+      printf "%s|%s|%s|%s|%s" "${cc:-}" "${country:-}" "${region:-}" "${city:-}" "${prov:-}"
+      return 0
+    fi
+  fi
+
+  printf "||||"
+}
+
+###############################################################################
+# Snapshots (before/after) - lightweight now (tuning is external)
+###############################################################################
+_swap_state() {
+  local s
+  s="$(/sbin/swapon --noheadings --show=NAME,SIZE 2>/dev/null | awk '{$1=$1; print}' | tr '\n' ';' | sed 's/;$//' || true)"
+  [[ -n "$s" ]] && echo "$s" || echo "none"
+}
+_nofile_systemd() {
+  local n
+  n="$(systemctl show --property DefaultLimitNOFILE 2>/dev/null | cut -d= -f2 || true)"
+  echo "${n:--}"
+}
+_unattended_reboot_setting() {
+  local reboot time
+  reboot="$(grep -Rhs 'Unattended-Upgrade::Automatic-Reboot' /etc/apt/apt.conf.d/*.conf 2>/dev/null \
+    | sed -nE 's/.*Automatic-Reboot\s+"([^"]+)".*/\1/p' | tail -n1 || true)"
+  time="$(grep -Rhs 'Unattended-Upgrade::Automatic-Reboot-Time' /etc/apt/apt.conf.d/*.conf 2>/dev/null \
+    | sed -nE 's/.*Automatic-Reboot-Time\s+"([^"]+)".*/\1/p' | tail -n1 || true)"
+  [[ -z "${reboot:-}" ]] && reboot="-"
+  [[ -z "${time:-}" ]] && time="-"
+  echo "${reboot} / ${time}"
+}
+_unattended_state() { echo "${1%% / *}"; }
+_unattended_time()  { echo "${1##* / }"; }
+
+snapshot_before() {
+  B_SWAP="$(_swap_state)"
+  B_NOFILE="$(_nofile_systemd)"
+  B_UNATT="$(_unattended_reboot_setting)"
+}
+snapshot_after() {
+  A_SWAP="$(_swap_state)"
+  A_NOFILE="$(_nofile_systemd)"
+  A_UNATT="$(_unattended_reboot_setting)"
+}
+
+###############################################################################
+# Table helpers
+###############################################################################
+row_kv() { local k="$1" v="$2"; printf "%-14s | %s\n" "$k" "$v"; }
+
+print_before_after_all() {
+  hdr "🧾 Before → After (all)"
+  printf "%-14s-+-%-32s-+-%-32s\n" "$(printf '%.0s-' {1..14})" "$(printf '%.0s-' {1..32})" "$(printf '%.0s-' {1..32})"
+
+  row3() {
+    local k="$1" b="$2" a="$3"
+    if [[ "$b" != "$a" ]]; then
+      printf "%-14s | %-32s | %-32s\n" "$k" "$(color "$c_grn" "$b")" "$(color "$c_grn" "$a")"
+    else
+      printf "%-14s | %-32s | %-32s\n" "$k" "$b" "$a"
+    fi
+  }
+
+  row3 "Swap"        "$B_SWAP" "$A_SWAP"
+  row3 "Nofile"      "$B_NOFILE" "$A_NOFILE"
+  row3 "AutoReboot"  "$(_unattended_state "$B_UNATT")" "$(_unattended_state "$A_UNATT")"
+  row3 "Reboot time" "$(_unattended_time "$B_UNATT")"  "$(_unattended_time "$A_UNATT")"
+}
+
+print_manifest_compact() {
+  local man="$1"
+  [[ -f "$man" ]] || return 0
+  local copies moves
+  copies="$(awk -F'\t' '$1=="COPY"{c++} END{print c+0}' "$man" 2>/dev/null || echo 0)"
+  moves="$(awk -F'\t' '$1=="MOVE"{c++} END{print c+0}' "$man" 2>/dev/null || echo 0)"
+
+  hdr "📦 Files"
+  echo "  backed up (COPY): $copies"
+  echo "  moved aside:      $moves"
+}
 
 ###############################################################################
 # Args + defaults
 ###############################################################################
 CMD="${1:-}"; shift || true
 
+# Defaults: interactive unless explicitly provided
 ARG_USER=""
 ARG_TIMEZONE="Europe/Moscow"
 ARG_REBOOT="5m"
 
 ARG_TAILSCALE=""         # 0/1, if empty -> interactive
 ARG_DNS_SWITCHER=""      # 0/1, if empty -> interactive
-ARG_DNS_PROFILE="1"      # 1..5
+ARG_DNS_PROFILE="1"      # 1..5 (dns-switcher menu)
 ARG_REMNANODE=""         # 0/1, if empty -> interactive
 ARG_SSH_HARDEN=""        # 0/1, if empty -> interactive
 ARG_OPEN_WAN_443=""      # 0/1, if empty -> interactive
-
-# External tuning
-ARG_TUNING=""            # 0/1, if empty -> enabled by default
-TUNING_URL="${TUNING_URL:-https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/main/initial.sh}"
 
 # remnanode inputs (asked early if needed)
 NODE_PORT=""
@@ -95,19 +312,25 @@ SECRET_KEY=""
 
 # URLs
 DNS_SWITCHER_URL="${DNS_SWITCHER_URL:-https://raw.githubusercontent.com/AndreyTimoschuk/dns-switcher/main/dns-switcher.sh}"
+
+# Zsh files
 ZSHRC_URL="${ZSHRC_URL:-https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/main/zshrc}"
 P10K_URL="${P10K_URL:-https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/main/p10k}"
+
+# External tuning script (your repo)
+EDGE_TUNING_URL="${EDGE_TUNING_URL:-https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/main/initial.sh}"
 
 # Logs
 APT_LOG="/var/log/vps-edge-apt.log"
 DNS_LOG="/var/log/vps-edge-dns-switcher.log"
 TS_LOG="/var/log/vps-edge-tailscale.log"
 DOCKER_LOG="/var/log/vps-edge-docker.log"
-TUNING_LOG="/var/log/vps-edge-tuning.log"
+TUNE_LOG="/var/log/vps-edge-tuning.log"
 ERR_LOG="/var/log/vps-edge-error.log"
 
-touch "$APT_LOG" "$DNS_LOG" "$TS_LOG" "$DOCKER_LOG" "$TUNING_LOG" "$ERR_LOG" 2>/dev/null || true
+touch "$APT_LOG" "$DNS_LOG" "$TS_LOG" "$DOCKER_LOG" "$TUNE_LOG" "$ERR_LOG" 2>/dev/null || true
 
+# Parse flags after command
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --user=*)          ARG_USER="${1#*=}"; shift ;;
@@ -119,7 +342,6 @@ while [[ $# -gt 0 ]]; do
     --remnanode=*)     ARG_REMNANODE="${1#*=}"; shift ;;
     --ssh-harden=*)    ARG_SSH_HARDEN="${1#*=}"; shift ;;
     --open-wan-443=*)  ARG_OPEN_WAN_443="${1#*=}"; shift ;;
-    --tuning=*)        ARG_TUNING="${1#*=}"; shift ;;
 
     --user)          ARG_USER="${2:-}"; shift 2 ;;
     --timezone)      ARG_TIMEZONE="${2:-}"; shift 2 ;;
@@ -130,8 +352,10 @@ while [[ $# -gt 0 ]]; do
     --remnanode)     ARG_REMNANODE="${2:-}"; shift 2 ;;
     --ssh-harden)    ARG_SSH_HARDEN="${2:-}"; shift 2 ;;
     --open-wan-443)  ARG_OPEN_WAN_443="${2:-}"; shift 2 ;;
-    --tuning)        ARG_TUNING="${2:-}"; shift 2 ;;
-    *) die "Unknown arg: $1" ;;
+
+    *)
+      die "Unknown arg: $1"
+      ;;
   esac
 done
 
@@ -139,6 +363,7 @@ usage() {
   cat <<'EOF'
 Usage:
   sudo ./vps-edge-run.sh apply [flags]
+  sudo ./vps-edge-run.sh rollback [--backup-dir=/root/edge-tuning-backup-...]
   sudo ./vps-edge-run.sh status
 
 Flags (apply):
@@ -146,17 +371,17 @@ Flags (apply):
   --timezone <TZ>              Default: Europe/Moscow
   --reboot <5m|30s|skip|none>  Default: 5m
 
-  --dns-switcher 0|1
-  --dns-profile 1..5
+  --dns-switcher 0|1           Run DNS switcher early
+  --dns-profile 1..5           DNS switcher profile (default: 1)
 
-  --tailscale 0|1
-  --tuning 0|1                 Call external tuning script (default: 1)
-  --remnanode 0|1
-  --ssh-harden 0|1
-  --open-wan-443 0|1
+  --tailscale 0|1              Install/up tailscale early (interactive URL flow)
+  --remnanode 0|1              Ensure /opt/remnanode + compose + start container
+  --ssh-harden 0|1             PasswordAuthentication no, PermitRootLogin no
+  --open-wan-443 0|1           WAN UFW allow only 443 (tcp+udp). Tailscale allow-all always when enabled
 
 Examples:
-  sudo ./vps-edge-run.sh apply --reboot=skip --tailscale=1 --tuning=1 --open-wan-443=1 --ssh-harden=1 --user akadorkin
+  sudo ./vps-edge-run.sh apply
+  sudo ./vps-edge-run.sh apply --reboot=skip --tailscale=1 --dns-switcher=1 --dns-profile=1 --remnanode=1 --ssh-harden=1 --open-wan-443=1 --user akadorkin
 EOF
 }
 
@@ -168,21 +393,14 @@ export NEEDRESTART_MODE=a
 
 aptq() {
   local what="$1"; shift
-  local cmd="${1:-}"; shift || true
-
-  local opts=(-y -qq -o Dpkg::Use-Pty=0)
-  if [[ "$cmd" != "update" ]]; then
-    opts+=(
-      -o Dpkg::Options::='--force-confdef'
-      -o Dpkg::Options::='--force-confold'
-    )
-  fi
-
-  if apt-get "${opts[@]}" "$cmd" "$@" >>"$APT_LOG" 2>&1; then
+  if apt-get -y -qq -o Dpkg::Use-Pty=0 \
+      -o Dpkg::Options::='--force-confdef' \
+      -o Dpkg::Options::='--force-confold' \
+      "$@" >>"$APT_LOG" 2>&1; then
     ok "$what"
   else
     err "$what failed. Tail:"
-    tail -n 80 "$APT_LOG" || true
+    tail -n 60 "$APT_LOG" || true
     die "APT error. Full log: $APT_LOG"
   fi
 }
@@ -194,7 +412,42 @@ ensure_packages() {
   aptq "Install base packages" install "$@"
 }
 
+###############################################################################
+# Detect distro (we assume Ubuntu/Debian-family)
+###############################################################################
 is_debian_like() { command -v apt-get >/dev/null 2>&1; }
+
+###############################################################################
+# Docker install (idempotent)
+###############################################################################
+docker_install() {
+  hdr "🐳 Docker"
+  if command -v docker >/dev/null 2>&1; then
+    ok "docker already installed"
+    return 0
+  fi
+
+  : >"$DOCKER_LOG" || true
+  if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg >>"$DOCKER_LOG" 2>&1 || true
+    chmod a+r /etc/apt/keyrings/docker.gpg || true
+  fi
+
+  local codename=""
+  codename="$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")"
+  [[ -n "$codename" ]] || codename="$(lsb_release -cs 2>/dev/null || true)"
+  [[ -n "$codename" ]] || die "Cannot detect distro codename"
+
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${codename} stable" \
+    > /etc/apt/sources.list.d/docker.list
+
+  aptq "APT update (docker)" update
+  aptq "Install Docker CE" install docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+  systemctl enable --now docker >>"$DOCKER_LOG" 2>&1 || true
+  ok "docker installed"
+}
 
 ###############################################################################
 # Timezone
@@ -209,7 +462,7 @@ timezone_apply() {
 }
 
 ###############################################################################
-# DNS switcher
+# DNS switcher (auto-yes + choose profile) with summary/tips
 ###############################################################################
 dns_apply() {
   hdr "🌐 DNS switcher (early)"
@@ -219,6 +472,8 @@ dns_apply() {
 
   info "Applying DNS profile ${profile} (auto-yes)"
   : >"$DNS_LOG" || true
+
+  backup_file /etc/systemd/resolved.conf
 
   local tmp="/tmp/dns-switcher.sh"
   if ! curl -fsSL "$DNS_SWITCHER_URL" -o "$tmp" >>"$DNS_LOG" 2>&1; then
@@ -232,49 +487,30 @@ dns_apply() {
   else
     warn "dns-switcher failed (see $DNS_LOG). Continuing."
   fi
+
+  local dns_line fb_line
+  dns_line="$(awk -F= 'tolower($1)=="dns"{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}' /etc/systemd/resolved.conf 2>/dev/null | head -n1 || true)"
+  fb_line="$(awk -F= 'tolower($1)=="fallbackdns"{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}' /etc/systemd/resolved.conf 2>/dev/null | head -n1 || true)"
+
+  hdr "🧾 DNS summary"
+  echo "Applied:"
+  echo "  - DNS:         ${dns_line:-"(unknown)"}"
+  echo "  - FallbackDNS: ${fb_line:-"(unknown)"}"
+  echo
+  echo "Now:"
+  resolvectl status 2>/dev/null | grep -E "DNS Servers|DNS Domain|Fallback DNS" || true
+  echo
+  echo "Tips:"
+  echo "  - Monitor DNS queries:"
+  echo "      sudo tcpdump -i any port 53 -n -Q out"
+  echo "  - Verify after reboot:"
+  echo "      sudo resolvectl status | grep -E \"DNS Servers|DNS Domain\""
+  echo "Backups:"
+  echo "  - /etc/dns-switcher-backup"
 }
 
 ###############################################################################
-# Docker install (idempotent, Debian/Ubuntu aware)
-###############################################################################
-docker_install() {
-  hdr "🐳 Docker"
-  if command -v docker >/dev/null 2>&1; then
-    ok "docker already installed"
-    return 0
-  fi
-
-  : >"$DOCKER_LOG" || true
-
-  local os_id=""
-  os_id="$(. /etc/os-release 2>/dev/null; echo "${ID:-}")"
-  local docker_os="ubuntu"
-  [[ "$os_id" == "debian" ]] && docker_os="debian"
-
-  if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
-    mkdir -p /etc/apt/keyrings
-    curl -fsSL "https://download.docker.com/linux/${docker_os}/gpg" \
-      | gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg >>"$DOCKER_LOG" 2>&1 || true
-    chmod a+r /etc/apt/keyrings/docker.gpg || true
-  fi
-
-  local codename=""
-  codename="$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")"
-  [[ -n "$codename" ]] || codename="$(lsb_release -cs 2>/dev/null || true)"
-  [[ -n "$codename" ]] || die "Cannot detect distro codename"
-
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${docker_os} ${codename} stable" \
-    > /etc/apt/sources.list.d/docker.list
-
-  aptq "APT update (docker)" update
-  aptq "Install Docker CE" install docker-ce docker-ce-cli containerd.io docker-compose-plugin
-
-  systemctl enable --now docker >>"$DOCKER_LOG" 2>&1 || true
-  ok "docker installed"
-}
-
-###############################################################################
-# Tailscale (idempotent; safe)
+# Tailscale (original-like flow: show auth URL + wait for Enter)
 ###############################################################################
 tailscale_install_if_needed() {
   if command -v tailscale >/dev/null 2>&1; then
@@ -289,12 +525,26 @@ tailscale_install_if_needed() {
   fi
 }
 
-tailscale_is_up() { tailscale status >/dev/null 2>&1; }
-tailscale_ip4() { tailscale ip -4 2>/dev/null | head -n1 || true; }
+tailscale_sysctl_tune() {
+  install -m 0644 /dev/stdin /etc/sysctl.d/95-edge-tailscale.conf <<'EOF'
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.default.rp_filter=0
+EOF
+  sysctl --system >/dev/null 2>&1 || true
+
+  local internet_iface=""
+  internet_iface="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)"
+  if [[ -n "$internet_iface" ]] && command -v ethtool >/dev/null 2>&1; then
+    ethtool -K "$internet_iface" gro on >/dev/null 2>&1 || true
+    ethtool -K "$internet_iface" rx-udp-gro-forwarding on >/dev/null 2>&1 || true
+  fi
+}
 
 tailscale_magicdns_name() {
   local name=""
-  if command -v jq >/dev/null 2>&1 && tailscale status --json >/dev/null 2>&1; then
+  if tailscale status --json >/dev/null 2>&1; then
     name="$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' 2>/dev/null || true)"
   fi
   if [[ -z "$name" ]]; then
@@ -304,16 +554,31 @@ tailscale_magicdns_name() {
   echo "$name"
 }
 
+tailscale_ip4() {
+  tailscale ip -4 2>/dev/null | head -n1 || true
+}
+
+tailscale_is_ready() {
+  # Your definition: "installed tailscale" == has IPv4 and returns device list normally.
+  local ip=""
+  ip="$(tailscale_ip4)"
+  [[ -n "$ip" ]] || return 1
+  tailscale status >/dev/null 2>&1 || return 1
+  return 0
+}
+
 tailscale_apply() {
   hdr "🧠 Tailscale (early)"
-  tailscale_install_if_needed
 
-  if tailscale_is_up; then
+  tailscale_install_if_needed
+  tailscale_sysctl_tune
+
+  if tailscale_is_ready; then
     local ip name
     ip="$(tailscale_ip4)"
-    [[ -n "$ip" ]] && ok "tailscale is up (ip ${ip})" || ok "tailscale is up"
+    ok "tailscale is up (ip ${ip})"
     name="$(tailscale_magicdns_name)"
-    [[ -n "$name" ]] && ok "MagicDNS: ${name}" || warn "MagicDNS name not available."
+    [[ -n "$name" ]] && ok "MagicDNS: ${name}" || warn "MagicDNS name not available (maybe disabled)."
     return 0
   fi
 
@@ -321,14 +586,13 @@ tailscale_apply() {
   local out="/tmp/vps-edge-tailscale-up.log"
   rm -f "$out" 2>/dev/null || true
 
+  # Original-like behavior:
+  # - run tailscale up and capture output
+  # - extract auth URL
+  # - user approves in browser and presses Enter
   set +e
-  tailscale up --ssh 2>&1 | tee "$out" >>"$TS_LOG"
-  local rc=${PIPESTATUS[0]}
+  tailscale up --advertise-exit-node --ssh 2>&1 | tee "$out" >>"$TS_LOG"
   set -e
-
-  if [[ "$rc" -ne 0 ]]; then
-    warn "tailscale up returned rc=${rc}. See: $TS_LOG"
-  fi
 
   local url=""
   url="$(grep -Eo 'https://login\.tailscale\.com/[a-zA-Z0-9/_-]+' "$out" | head -n1 || true)"
@@ -337,52 +601,35 @@ tailscale_apply() {
     echo "🔗 Authenticate Tailscale in browser:"
     echo "   $url"
     echo
-    read_tty _ "Press Enter after you approve the device in Tailscale admin… "
+  else
+    warn "Auth URL not found in tailscale output (maybe already authorized, or output format changed)."
+    warn "If not authorized yet, run manually:"
+    warn "  tailscale up --advertise-exit-node --ssh"
+    echo
   fi
 
+  read_tty _ "Press Enter after you approve the device in Tailscale… "
+
   local ip=""
-  for _i in {1..30}; do
-    ip="$(tailscale_ip4)"
-    [[ -n "$ip" ]] && break
+  for _i in {1..60}; do
+    if tailscale_is_ready; then
+      ip="$(tailscale_ip4)"
+      break
+    fi
     sleep 1
   done
 
-  [[ -n "$ip" ]] && ok "tailscale is up (ip ${ip})" || warn "tailscale IP not detected (maybe still pending auth)."
-  local name
-  name="$(tailscale_magicdns_name)"
-  [[ -n "$name" ]] && ok "MagicDNS: ${name}" || warn "MagicDNS name not available."
-}
-
-###############################################################################
-# External tuning (your script)
-###############################################################################
-TUNING_BACKUP_DIR=""
-
-tuning_apply_external() {
-  hdr "🧠 Kernel + system tuning (external)"
-
-  : >"$TUNING_LOG" || true
-
-  info "Calling: ${TUNING_URL} apply --reboot=skip"
-  set +e
-  # IMPORTANT: run with reboot=skip, big script will decide about reboot itself
-  curl -fsSL "$TUNING_URL" | bash -s -- apply --reboot=skip 2>&1 | tee -a "$TUNING_LOG"
-  local rc=${PIPESTATUS[1]}
-  set -e
-
-  # Best-effort parse BACKUP_DIR=... if your tuning script prints it
-  local b=""
-  b="$(grep -Eo 'BACKUP_DIR=/root/edge-tuning-backup-[0-9]{8}-[0-9]{6}' "$TUNING_LOG" | tail -n1 | cut -d= -f2 || true)"
-  [[ -n "$b" ]] && TUNING_BACKUP_DIR="$b"
-
-  if [[ "$rc" -ne 0 ]]; then
-    err "External tuning failed (rc=${rc}). See log: $TUNING_LOG"
-    [[ -n "$TUNING_BACKUP_DIR" ]] && warn "Tuning rollback hint: sudo BACKUP_DIR=${TUNING_BACKUP_DIR} bash -s -- rollback (same tuning script)"
-    return "$rc"
+  if tailscale_is_ready; then
+    ip="$(tailscale_ip4)"
+    ok "tailscale is up (ip ${ip})"
+    local name
+    name="$(tailscale_magicdns_name)"
+    [[ -n "$name" ]] && ok "MagicDNS: ${name}" || warn "MagicDNS name not available (maybe disabled)."
+  else
+    warn "tailscale is installed but not ready yet (no IPv4/status)."
+    warn "You can re-run:"
+    warn "  tailscale up --advertise-exit-node --ssh"
   fi
-
-  ok "External tuning applied"
-  [[ -n "$TUNING_BACKUP_DIR" ]] && ok "Tuning backup: $TUNING_BACKUP_DIR"
 }
 
 ###############################################################################
@@ -433,6 +680,7 @@ zsh_disable_update_prompts() {
 ensure_ohmyzsh_for_user() {
   local uname="$1"
   local home="$2"
+
   [[ -d "$home" ]] || return 0
 
   grep -q '^/usr/bin/zsh$' /etc/shells 2>/dev/null || echo '/usr/bin/zsh' >> /etc/shells
@@ -540,6 +788,8 @@ ssh_harden_apply() {
   local cfg="/etc/ssh/sshd_config"
   [[ -f "$cfg" ]] || { warn "sshd_config not found; skip"; return 0; }
 
+  backup_file "$cfg"
+
   sed -i 's/^[[:space:]]*#\?[[:space:]]*PasswordAuthentication[[:space:]].*/PasswordAuthentication no/' "$cfg" || true
   sed -i 's/^[[:space:]]*#\?[[:space:]]*PermitRootLogin[[:space:]].*/PermitRootLogin no/' "$cfg" || true
 
@@ -551,36 +801,8 @@ ssh_harden_apply() {
 }
 
 ###############################################################################
-# UFW firewall (SAFE for SSH + Tailscale)
+# UFW firewall (fixed to behave closer to your working version)
 ###############################################################################
-detect_wan_iface() {
-  local internet_iface=""
-  internet_iface="$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -n1 || true)"
-  [[ -n "$internet_iface" ]] || internet_iface="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)"
-  echo "$internet_iface"
-}
-
-ssh_session_failsafe_allow() {
-  # If running under SSH, allow current remote IP to current SSH port on WAN iface
-  local wan_if="$1"
-  [[ -n "$wan_if" ]] || return 0
-
-  local ssh_port=""
-  ssh_port="$(ss -ltn 2>/dev/null | awk '$4 ~ /:22$/ {found=1} END{ if(found) print 22 }' || true)"
-  [[ -n "$ssh_port" ]] || ssh_port="22"
-
-  local rip=""
-  if [[ -n "${SSH_CONNECTION:-}" ]]; then
-    rip="$(awk '{print $1}' <<<"$SSH_CONNECTION" 2>/dev/null || true)"
-  fi
-
-  if [[ -n "$rip" ]]; then
-    # Only allow from that single IP
-    ufw allow in on "$wan_if" from "$rip" to any port "$ssh_port" proto tcp >/dev/null 2>&1 || true
-    ok "Failsafe: allow SSH from ${rip} to ${wan_if}:${ssh_port}/tcp"
-  fi
-}
-
 ufw_apply() {
   hdr "🧱 Firewall (UFW)"
 
@@ -588,7 +810,8 @@ ufw_apply() {
     aptq "Install UFW" install ufw
   fi
 
-  # Make forwarding policy ACCEPT (Docker/Tailscale routing cases)
+  backup_file /etc/default/ufw
+
   if [[ -f /etc/default/ufw ]]; then
     if grep -q '^DEFAULT_FORWARD_POLICY=' /etc/default/ufw; then
       sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw || true
@@ -597,46 +820,29 @@ ufw_apply() {
     fi
   fi
 
-  local wan_if=""
-  wan_if="$(detect_wan_iface)"
-  [[ -n "$wan_if" ]] || { warn "Cannot detect WAN iface; skipping UFW"; return 0; }
-  ok "WAN iface: ${wan_if}"
-
-  # Record current status before touching
-  ufw status verbose >>"$ERR_LOG" 2>&1 || true
+  local internet_iface=""
+  internet_iface="$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -n1 || true)"
+  [[ -n "$internet_iface" ]] || internet_iface="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)"
+  [[ -n "$internet_iface" ]] || { warn "Cannot detect WAN iface; skipping UFW"; return 0; }
 
   ufw --force reset >/dev/null 2>&1 || true
   ufw default deny incoming >/dev/null 2>&1 || true
   ufw default allow outgoing >/dev/null 2>&1 || true
 
-  # Critical: don't lock yourself out if running via SSH
-  ssh_session_failsafe_allow "$wan_if"
-
-  # WAN 443 (optional)
   if [[ "${ARG_OPEN_WAN_443}" == "1" ]]; then
-    ufw allow in on "$wan_if" to any port 443 proto tcp >/dev/null 2>&1 || true
-    ufw allow in on "$wan_if" to any port 443 proto udp >/dev/null 2>&1 || true
-    ok "WAN (${wan_if}): allow 443/tcp, 443/udp"
+    ufw allow in on "$internet_iface" to any port 443 proto tcp >/dev/null 2>&1 || true
+    ufw allow in on "$internet_iface" to any port 443 proto udp >/dev/null 2>&1 || true
+    ok "WAN (${internet_iface}): allow 443/tcp, 443/udp"
   else
-    warn "WAN (${wan_if}): no inbound ports opened by policy (open-wan-443=0)"
+    warn "WAN (${internet_iface}): no inbound ports opened (open-wan-443=0)"
   fi
 
-  # If Tailscale enabled: allow UDP 41641 on WAN for direct peer-to-peer
-  if [[ "${ARG_TAILSCALE}" == "1" ]]; then
-    ufw allow in on "$wan_if" to any port 41641 proto udp >/dev/null 2>&1 || true
-    ok "WAN (${wan_if}): allow 41641/udp for tailscale P2P"
-  fi
+  # Important: allow tailscale0 even if not present yet (match your original approach).
+  ufw allow in on tailscale0 >/dev/null 2>&1 || true
+  ufw allow out on tailscale0 >/dev/null 2>&1 || true
+  ok "Tailscale (tailscale0): allow all (in/out) [rule added]"
 
-  # Tailscale interface allow-all (only if exists)
-  if ip link show tailscale0 >/dev/null 2>&1; then
-    ufw allow in on tailscale0 >/dev/null 2>&1 || true
-    ufw allow out on tailscale0 >/dev/null 2>&1 || true
-    ok "Tailscale (tailscale0): allow all (in/out)"
-  else
-    warn "tailscale0 not found (tailscale disabled or not up yet)."
-  fi
-
-  # Docker bridges allow-all
+  # Allow Docker bridges (if present)
   local docker_ifaces=""
   docker_ifaces="$(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^(docker0|br-)/ {print $2}' || true)"
   if [[ -n "$docker_ifaces" ]]; then
@@ -645,11 +851,18 @@ ufw_apply() {
       ufw allow out on "$ifc" >/dev/null 2>&1 || true
     done
     ok "Docker bridges: allow all (in/out)"
+  else
+    warn "Docker bridges not found (docker0/br-*)."
   fi
+
+  # Make sure ufw is enabled on boot (your old script did this)
+  backup_file /etc/cron.d/enable-ufw
+  install -m 0644 /dev/stdin /etc/cron.d/enable-ufw <<'EOF'
+@reboot root ufw --force enable && ufw reload
+EOF
 
   ufw --force enable >/dev/null 2>&1 || true
   ok "ufw enabled"
-  ufw status verbose 2>/dev/null || true
 }
 
 ###############################################################################
@@ -705,15 +918,19 @@ remnanode_collect_inputs_early() {
 
 remnanode_apply() {
   hdr "🧩 remnanode"
+
   docker_install
 
   local dir="/opt/remnanode"
   local compose="${dir}/docker-compose.yml"
+
   mkdir -p "$dir" >/dev/null 2>&1 || true
 
   if [[ ! -f "$compose" ]]; then
     [[ "${SKIP_REMNANODE_INPUTS:-0}" == "1" ]] && { warn "remnanode compose missing but inputs skipped; not creating"; return 0; }
     [[ -n "${SECRET_KEY:-}" ]] || { warn "SECRET_KEY missing; not creating remnanode compose"; return 0; }
+
+    backup_file "$compose"
 
     cat > "$compose" <<EOF
 services:
@@ -747,8 +964,12 @@ EOF
 
 remnanode_logrotate_apply() {
   hdr "🗂️  Remnanode logrotate"
+
   aptq "Ensure logrotate installed" install logrotate
+
   mkdir -p /var/log/remnanode
+
+  backup_file /etc/logrotate.d/remnanode
   cat >/etc/logrotate.d/remnanode <<'EOF'
 /var/log/remnanode/*.log {
     size 50M
@@ -760,6 +981,7 @@ remnanode_logrotate_apply() {
 }
 EOF
   ok "logrotate config written: /etc/logrotate.d/remnanode"
+
   logrotate -vf /etc/logrotate.d/remnanode >>"$ERR_LOG" 2>&1 || true
   ok "logrotate test completed"
 }
@@ -768,6 +990,53 @@ remnanode_status_line() {
   if command -v docker >/dev/null 2>&1; then
     docker ps --format '{{.Names}} {{.Status}}' 2>/dev/null | awk '$1=="remnanode"{ $1=""; sub(/^ /,""); print "remnanode " $0 }' | head -n1 || true
   fi
+}
+
+###############################################################################
+# Kernel + system tuning (external script call)
+###############################################################################
+tuning_apply() {
+  hdr "🧠 Kernel + system tuning (external)"
+
+  : >"$TUNE_LOG" || true
+
+  # Call your tuning script as-is (it has its own backups/rollback).
+  # We do NOT modify its behavior here (keep it "original"; no extra logic).
+  if curl -fsSL "$EDGE_TUNING_URL" | bash -s -- apply >>"$TUNE_LOG" 2>&1; then
+    ok "external tuning applied (log: $TUNE_LOG)"
+  else
+    err "external tuning failed (see tail below)"
+    tail -n 120 "$TUNE_LOG" || true
+    die "tuning failed. Full log: $TUNE_LOG"
+  fi
+}
+
+###############################################################################
+# Summary header: provider/geo
+###############################################################################
+print_start_end_banner() {
+  local title="$1"
+  local ip cc country region city org flag
+  ip="$(ext_ip)"
+  [[ -n "$ip" ]] || ip="?"
+  local gl
+  gl="$(geo_lookup "$ip")"
+  cc="${gl%%|*}"
+  country="$(echo "$gl" | cut -d'|' -f2)"
+  region="$(echo "$gl" | cut -d'|' -f3)"
+  city="$(echo "$gl" | cut -d'|' -f4)"
+  org="$(echo "$gl" | cut -d'|' -f5)"
+
+  flag="$(country_flag "$cc")"
+
+  hdr "$title"
+  echo "  ${flag} ${ip} — ${city:-?}, ${region:-?}, ${cc:-?} — ${org:-?}"
+  WAN_IP="$ip"
+  GEO_CC="$cc"
+  GEO_CITY="$city"
+  GEO_REGION="$region"
+  GEO_PROVIDER="$org"
+  GEO_FLAG="$flag"
 }
 
 ###############################################################################
@@ -795,12 +1064,12 @@ maybe_reboot() {
 }
 
 ###############################################################################
-# Apply / status
+# Apply / rollback / status
 ###############################################################################
 on_apply_fail() {
   local code=$?
   err "Apply failed (exit code=$code)."
-  err "See logs: ${ERR_LOG}, ${APT_LOG}, ${TS_LOG}, ${TUNING_LOG}"
+  warn "Rollback: sudo BACKUP_DIR=$backup_dir $0 rollback"
   exit "$code"
 }
 
@@ -810,16 +1079,19 @@ apply_cmd() {
 
   is_debian_like || die "This script expects Debian/Ubuntu (apt)."
 
-  # Defaults
-  if [[ -z "${ARG_TUNING}" ]]; then ARG_TUNING="1"; fi
+  mkbackup
+  snapshot_before
 
   if [[ -z "${ARG_USER}" ]]; then
-    if [[ -t 0 ]]; then read_tty ARG_USER "User to create/ensure (leave empty to skip): "; fi
+    if [[ -t 0 ]]; then
+      read_tty ARG_USER "User to create/ensure (leave empty to skip): "
+    fi
   fi
 
   if [[ -z "${ARG_DNS_SWITCHER}" ]]; then
     if [[ -t 0 ]]; then
-      local a="n"; read_tty a "Run DNS switcher early? [y/N]: "
+      local a="n"
+      read_tty a "Run DNS switcher early? [y/N]: "
       [[ "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_DNS_SWITCHER="1" || ARG_DNS_SWITCHER="0"
     else
       ARG_DNS_SWITCHER="0"
@@ -828,7 +1100,8 @@ apply_cmd() {
 
   if [[ -z "${ARG_TAILSCALE}" ]]; then
     if [[ -t 0 ]]; then
-      local a="y"; read_tty a "Enable Tailscale early? [Y/n]: "
+      local a="y"
+      read_tty a "Enable Tailscale early? [Y/n]: "
       [[ -z "$a" || "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_TAILSCALE="1" || ARG_TAILSCALE="0"
     else
       ARG_TAILSCALE="1"
@@ -837,7 +1110,8 @@ apply_cmd() {
 
   if [[ -z "${ARG_REMNANODE}" ]]; then
     if [[ -t 0 ]]; then
-      local a="n"; read_tty a "Install/start remnanode? [y/N]: "
+      local a="n"
+      read_tty a "Install/start remnanode? [y/N]: "
       [[ "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_REMNANODE="1" || ARG_REMNANODE="0"
     else
       ARG_REMNANODE="0"
@@ -846,7 +1120,8 @@ apply_cmd() {
 
   if [[ -z "${ARG_SSH_HARDEN}" ]]; then
     if [[ -t 0 ]]; then
-      local a="n"; read_tty a "Apply SSH hardening? [y/N]: "
+      local a="n"
+      read_tty a "Apply SSH hardening? [y/N]: "
       [[ "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_SSH_HARDEN="1" || ARG_SSH_HARDEN="0"
     else
       ARG_SSH_HARDEN="0"
@@ -855,7 +1130,8 @@ apply_cmd() {
 
   if [[ -z "${ARG_OPEN_WAN_443}" ]]; then
     if [[ -t 0 ]]; then
-      local a="y"; read_tty a "Open WAN only 443 via UFW? [Y/n]: "
+      local a="y"
+      read_tty a "Open WAN only 443 via UFW? [Y/n]: "
       [[ -z "$a" || "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_OPEN_WAN_443="1" || ARG_OPEN_WAN_443="0"
     else
       ARG_OPEN_WAN_443="1"
@@ -870,27 +1146,25 @@ apply_cmd() {
     curl wget ca-certificates gnupg lsb-release apt-transport-https \
     jq iproute2 ethtool openssl logrotate cron ufw iperf3 git zsh mc
 
+  print_start_end_banner "🏁 Start"
+
   timezone_apply
 
   if [[ "${ARG_DNS_SWITCHER}" == "1" ]]; then
     dns_apply
   fi
 
-  # Tailscale first (so firewall can safely allow tailscale0 and not lock you out)
   if [[ "${ARG_TAILSCALE}" == "1" ]]; then
     tailscale_apply
   fi
 
-  # External tuning (your script)
-  if [[ "${ARG_TUNING}" == "1" ]]; then
-    tuning_apply_external
-  else
-    warn "External tuning skipped (--tuning=0)"
-  fi
-
-  # Docker / remnanode
   if [[ "${ARG_REMNANODE}" == "1" ]]; then
     docker_install
+  else
+    if command -v docker >/dev/null 2>&1; then
+      hdr "🐳 Docker"
+      ok "docker already installed"
+    fi
   fi
 
   if [[ -n "${ARG_USER}" ]]; then
@@ -902,11 +1176,12 @@ apply_cmd() {
 
   zsh_apply_all_users
 
+  tuning_apply
+
   if [[ "${ARG_SSH_HARDEN}" == "1" ]]; then
     ssh_harden_apply
   fi
 
-  # Firewall after tailscale attempt (safe) + opens 41641/udp if tailscale enabled
   ufw_apply
 
   iperf3_server_apply
@@ -919,48 +1194,109 @@ apply_cmd() {
   hdr "🧹 Autoremove"
   aptq "Autoremove" autoremove --purge
 
+  snapshot_after
+
+  print_start_end_banner "🏁 End"
+
+  print_before_after_all
+  print_manifest_compact "$manifest"
+
+  local ts_ip ts_name
+  ts_ip=""
+  ts_name=""
+  if command -v tailscale >/dev/null 2>&1; then
+    ts_ip="$(tailscale_ip4)"
+    ts_name="$(tailscale_magicdns_name)"
+  fi
+
+  local remna_line=""
+  remna_line="$(remnanode_status_line)"
+
   hdr "🧾 Summary"
-  echo "Host:        $(host_short)"
-  echo "Timezone:    ${ARG_TIMEZONE}"
-  echo "Tailscale:   ${ARG_TAILSCALE}"
-  echo "UFW WAN 443: ${ARG_OPEN_WAN_443}"
-  echo "Tuning:      ${ARG_TUNING}"
-  [[ -n "${TUNING_BACKUP_DIR:-}" ]] && echo "Tuning backup: ${TUNING_BACKUP_DIR}"
+  row_kv "Host"        "$(host_short)"
+  row_kv "WAN"         "${GEO_FLAG:-🏳️} ${WAN_IP:-?}"
+  row_kv "Geo"         "${GEO_CITY:-?}, ${GEO_REGION:-?}, ${GEO_CC:-?}"
+  row_kv "Provider"    "${GEO_PROVIDER:-?}"
+  if [[ -n "${ts_ip:-}" ]]; then row_kv "Tailscale IP" "${ts_ip}"; else row_kv "Tailscale IP" "-"; fi
+  if [[ -n "${ts_name:-}" ]]; then row_kv "MagicDNS" "${ts_name}"; else row_kv "MagicDNS" "-"; fi
   if [[ -n "${ARG_USER:-}" ]]; then
     if [[ "${USER_CREATED:-0}" == "1" ]]; then
-      echo "User:        ${ARG_USER}"
-      echo "Password:    ${USER_PASS}"
+      row_kv "User"      "${ARG_USER}"
+      row_kv "Password"  "${USER_PASS}"
     else
-      echo "User:        ${ARG_USER}"
-      echo "Password:    (unchanged)"
+      row_kv "User"      "${ARG_USER}"
+      row_kv "Password"  "(unchanged)"
     fi
+  else
+    row_kv "User"      "-"
+    row_kv "Password"  "-"
   fi
-  if command -v tailscale >/dev/null 2>&1; then
-    echo "Tailscale IP: $(tailscale_ip4 || true)"
-    echo "MagicDNS:     $(tailscale_magicdns_name || true)"
+  if [[ -n "${remna_line:-}" ]]; then
+    row_kv "remnanode"  "${remna_line#remnanode }"
+    row_kv "compose"    "/opt/remnanode/docker-compose.yml"
+  else
+    row_kv "remnanode"  "-"
+    row_kv "compose"    "-"
   fi
+
+  hdr "📚 Backup + logs"
+  echo "Backup (this script): ${backup_dir}"
   echo "Logs:"
-  echo "  - APT:       ${APT_LOG}"
-  echo "  - DNS:       ${DNS_LOG}"
-  echo "  - Tailscale: ${TS_LOG}"
-  echo "  - Docker:    ${DOCKER_LOG}"
-  echo "  - Tuning:    ${TUNING_LOG}"
-  echo "  - Error:     ${ERR_LOG}"
+  echo "  - 📦 APT:       ${APT_LOG}"
+  echo "  - 🌐 DNS:       ${DNS_LOG}"
+  echo "  - 🧠 Tailscale: ${TS_LOG}"
+  echo "  - 🐳 Docker:    ${DOCKER_LOG}"
+  echo "  - 🧠 Tuning:    ${TUNE_LOG}"
+  echo "  - 🛑 Error:     ${ERR_LOG}"
+  echo "BACKUP_DIR=${backup_dir}"
 
   maybe_reboot
 }
 
+rollback_cmd() {
+  need_root "$@"
+
+  local backup="${BACKUP_DIR:-}"
+  if [[ -z "$backup" ]]; then
+    if [[ "${1:-}" =~ ^--backup-dir= ]]; then
+      backup="${1#*=}"
+    fi
+  fi
+  [[ -n "$backup" ]] || backup="$(latest_backup_dir)"
+  [[ -n "$backup" && -d "$backup" ]] || die "Backup not found. Set BACKUP_DIR=/root/edge-tuning-backup-... or run apply first."
+
+  snapshot_before
+
+  # Roll back ONLY files this script owns (tuning is external; use its rollback separately if needed)
+  rm -f /etc/cron.d/enable-ufw \
+        /etc/systemd/system/iperf3.service 2>/dev/null || true
+
+  restore_manifest "$backup"
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl disable --now iperf3 >/dev/null 2>&1 || true
+
+  snapshot_after
+
+  ok "Rolled back. Backup used: $backup"
+  print_before_after_all
+  print_manifest_compact "${backup}/MANIFEST.tsv"
+  warn "Note: external tuning rollback is separate (see your tuning script backups)."
+}
+
 status_cmd() {
+  snapshot_before
   hdr "📊 Current"
-  echo "Host: $(host_short)"
-  echo "UFW:"
-  ufw status verbose 2>/dev/null || echo "ufw not available"
-  echo
-  echo "Tailscale:"
+  row_kv "Host"       "$(host_short)"
+  row_kv "Swap"       "$B_SWAP"
+  row_kv "Nofile"     "$B_NOFILE"
+  row_kv "AutoReboot" "$(_unattended_state "$B_UNATT")"
+  row_kv "RebootTime" "$(_unattended_time "$B_UNATT")"
   if command -v tailscale >/dev/null 2>&1; then
-    tailscale status 2>/dev/null || true
-  else
-    echo "tailscale not installed"
+    row_kv "Tailscale IP" "$(tailscale_ip4 || true)"
+  fi
+  if command -v ufw >/dev/null 2>&1; then
+    row_kv "UFW" "$(ufw status 2>/dev/null | head -n1 || true)"
   fi
 }
 
@@ -969,7 +1305,11 @@ status_cmd() {
 ###############################################################################
 case "$CMD" in
   apply)    apply_cmd ;;
+  rollback) rollback_cmd "$@" ;;
   status)   status_cmd ;;
   ""|help|-h|--help) usage; exit 0 ;;
-  *) usage; exit 1 ;;
+  *)
+    usage
+    exit 1
+    ;;
 esac
