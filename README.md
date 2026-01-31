@@ -9,14 +9,8 @@ This script is designed to be **idempotent**, **re-runnable**, and **reversible*
 ## TL;DR
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/akadorkin/remnanode-install-script/main/vps-edge-run.sh \
-| sudo bash -s -- apply \
-  --user admin \
-  --tailscale=1 \
-  --dns-switcher=1 --dns-profile=1 \
-  --remnanode=1 \
-  --ssh-harden=1 \
-  --open-wan-443=1
+curl -fsSL https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/vps-edge-run.sh | sudo bash -s -- \
+  --user=akadorkin --timezone=Europe/Moscow --remnanode=1 --dns-switch=0 --reboot=0
 ```
 
 Result:
