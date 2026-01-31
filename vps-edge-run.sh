@@ -12,15 +12,13 @@ set -Eeuo pipefail
 
 ###############################################################################
 # Goals (apply):
-# - Hostname prompt (optional; early)
-# - Tailscale (early; "hand-mode": run tailscale up, print URL, optional Enter)
-# - Node Exporter install (optional; runs "in background" from script POV)
+# - (NEW) Optional hostname change (interactive)
+# - Tailscale (optional, early; "hand-mode": show URL, ask Enter, continue)
+# - Node Exporter install (optional; runs in background from script POV)
 # - Docker + remnanode (optional)
 # - Zsh stack for all /home/* users + root (optional-ish, enabled by default)
-# - SSH hardening (optional)
-# - System tuning (sysctl/swap/nofile/journald/logrotate/unattended) (late)
-# - DNS switcher (optional, late)
-# - UFW (very last): WAN only 443 (optional), allow tailscale0, allow docker bridges
+# - System tuning + DNS switcher moved toward the end (per request)
+# - UFW: moved to very end (after all tweaks)
 # - iperf3 server enabled always
 #
 # Commands:
@@ -224,7 +222,11 @@ geo_lookup() {
       as="$(printf "%s" "$out" | jq -r '.as // empty' 2>/dev/null || true)"
       isp="$(printf "%s" "$out" | jq -r '.isp // empty' 2>/dev/null || true)"
       org="$(printf "%s" "$out" | jq -r '.org // empty' 2>/dev/null || true)"
-      printf "%s|%s|%s|%s|%s" "${cc:-}" "${country:-}" "${region:-}" "${city:-}" "${as:-$org:-$isp}"
+      # "as:-$org:-$isp" was a bash gotcha; do it explicitly
+      local who="${as:-}"
+      [[ -n "$who" ]] || who="${org:-}"
+      [[ -n "$who" ]] || who="${isp:-}"
+      printf "%s|%s|%s|%s|%s" "${cc:-}" "${country:-}" "${region:-}" "${city:-}" "${who:-}"
       return 0
     fi
   fi
@@ -408,8 +410,6 @@ ARG_USER=""
 ARG_TIMEZONE="Europe/Moscow"
 ARG_REBOOT="5m"
 
-ARG_HOSTNAME=""          # interactive if empty; Enter keeps existing
-
 ARG_TAILSCALE=""         # 0/1; interactive if empty
 ARG_DNS_SWITCHER=""      # 0/1; interactive if empty
 ARG_DNS_PROFILE="1"      # 1..5
@@ -442,7 +442,6 @@ touch "$APT_LOG" "$DNS_LOG" "$TS_LOG" "$DOCKER_LOG" "$NODE_EXPORTER_LOG" "$ERR_L
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --user=*)          ARG_USER="${1#*=}"; shift ;;
-    --hostname=*)      ARG_HOSTNAME="${1#*=}"; shift ;;
     --timezone=*)      ARG_TIMEZONE="${1#*=}"; shift ;;
     --reboot=*)        ARG_REBOOT="${1#*=}"; shift ;;
     --tailscale=*)     ARG_TAILSCALE="${1#*=}"; shift ;;
@@ -455,7 +454,6 @@ while [[ $# -gt 0 ]]; do
     --zsh-all-users=*) ARG_ZSH_ALL_USERS="${1#*=}"; shift ;;
 
     --user)          ARG_USER="${2:-}"; shift 2 ;;
-    --hostname)      ARG_HOSTNAME="${2:-}"; shift 2 ;;
     --timezone)      ARG_TIMEZONE="${2:-}"; shift 2 ;;
     --reboot)        ARG_REBOOT="${2:-}"; shift 2 ;;
     --tailscale)     ARG_TAILSCALE="${2:-}"; shift 2 ;;
@@ -478,25 +476,22 @@ Usage:
   sudo ./vps-edge-run.sh status
 
 Flags (apply):
-  --hostname <name>            Set hostname (interactive if omitted; Enter keeps current)
   --user <name>                Create/ensure user (optional; interactive if omitted)
   --timezone <TZ>              Default: Europe/Moscow
   --reboot <5m|30s|skip|none>  Default: 5m
 
-  --tailscale 0|1              Run tailscale early (hand-mode: tailscale up -> print URL -> optional Enter)
-                               Enter is ALWAYS required if tailscale0 interface is missing.
-                               Also respects EDGE_TAILSCALE_REQUIRE_ENTER=1 (always ask Enter).
+  --tailscale 0|1              Hand-mode: run `tailscale up --ssh` in background, print URL, ask Enter, continue.
+                               If tailscale0 is missing -> Enter prompt is ALWAYS shown.
+                               Set EDGE_TAILSCALE_REQUIRE_ENTER=1 to always require Enter (even if URL exists).
+
   --node-exporter 0|1          Install Node Exporter using:
                                  bash <(curl -fsSL raw.githubusercontent.com/hteppl/sh/master/node_install.sh)
 
   --remnanode 0|1              Ensure /opt/remnanode + compose + start container
   --ssh-harden 0|1             PasswordAuthentication no, PermitRootLogin no
-
-  --dns-switcher 0|1           Run DNS switcher (LATE, near the end)
+  --open-wan-443 0|1           WAN UFW allow only 443 (tcp+udp). (UFW is applied at the very end.)
+  --dns-switcher 0|1           Run DNS switcher (moved toward the end)
   --dns-profile 1..5           DNS switcher profile (default: 1)
-
-  --open-wan-443 0|1           WAN UFW allow only 443 (tcp+udp).
-                               UFW is applied VERY LAST.
 
   --zsh-all-users 0|1          Ensure oh-my-zsh + p10k for all /home/* users + root (default: 1)
 
@@ -539,47 +534,26 @@ ensure_packages() {
 is_debian_like() { command -v apt-get >/dev/null 2>&1; }
 
 ###############################################################################
-# Hostname apply (interactive; Enter keeps existing)
+# Hostname (interactive)
 ###############################################################################
-hostname_apply() {
+hostname_apply_interactive() {
   hdr "🏷️ Hostname"
-  local cur=""
-  cur="$(hostnamectl --static 2>/dev/null || hostname 2>/dev/null || true)"
-  [[ -n "$cur" ]] || cur="$(hostname 2>/dev/null || true)"
-
-  local hn="${ARG_HOSTNAME:-}"
-  if [[ -z "${hn}" ]]; then
-    read_tty hn "Hostname (Enter keeps '${cur}'): "
-  fi
-
-  hn="${hn:-}"
-  if [[ -z "$hn" ]]; then
-    ok "Hostname unchanged: ${cur}"
-    return 0
-  fi
-
-  if [[ "$hn" == "$cur" ]]; then
-    ok "Hostname already set: ${cur}"
-    return 0
-  fi
-
-  # backups for rollback
-  backup_file /etc/hostname
-  backup_file /etc/hosts
-
-  hostnamectl set-hostname "$hn" >>"$ERR_LOG" 2>&1 || true
-  echo "$hn" > /etc/hostname 2>>"$ERR_LOG" || true
-
-  # best-effort /etc/hosts: keep 127.0.0.1 localhost, update 127.0.1.1 hostname
-  if [[ -f /etc/hosts ]]; then
-    if grep -qE '^\s*127\.0\.1\.1\s+' /etc/hosts; then
-      sed -i -E "s/^\s*127\.0\.1\.1\s+.*/127.0.1.1\t${hn}/" /etc/hosts || true
+  local cur newh
+  cur="$(hostname 2>/dev/null || echo "")"
+  echo "Current: ${cur:-?}"
+  if _has_dev_tty; then
+    read_tty newh "Enter new hostname (press Enter to keep current): "
+    if [[ -n "${newh:-}" ]]; then
+      backup_file /etc/hostname
+      backup_file /etc/hosts
+      hostnamectl set-hostname "$newh" >>"$ERR_LOG" 2>&1 || true
+      ok "Hostname set to: $newh"
     else
-      echo -e "127.0.1.1\t${hn}" >> /etc/hosts
+      ok "Hostname unchanged"
     fi
+  else
+    warn "No /dev/tty available -> hostname unchanged"
   fi
-
-  ok "Hostname set to ${hn}"
 }
 
 ###############################################################################
@@ -593,6 +567,7 @@ docker_install() {
   fi
 
   : >"$DOCKER_LOG" || true
+
   if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
     mkdir -p /etc/apt/keyrings
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg >>"$DOCKER_LOG" 2>&1 || true
@@ -627,10 +602,10 @@ timezone_apply() {
 }
 
 ###############################################################################
-# DNS switcher (LATE)
+# DNS switcher (moved toward end)
 ###############################################################################
 dns_apply() {
-  hdr "🌐 DNS switcher (late)"
+  hdr "🌐 DNS switcher"
   local profile="${ARG_DNS_PROFILE:-1}"
   [[ "$profile" =~ ^[1-5]$ ]] || profile="1"
 
@@ -669,7 +644,7 @@ dns_apply() {
 }
 
 ###############################################################################
-# Tailscale (hand-mode; no clever waits)
+# Tailscale (hand-mode, simple)
 ###############################################################################
 tailscale_install_if_needed() {
   : >"$TS_LOG" 2>/dev/null || true
@@ -690,59 +665,64 @@ tailscale_restart_daemon() {
   systemctl restart tailscaled >>"$TS_LOG" 2>&1 || true
 }
 
+tailscale_ip4() { tailscale ip -4 2>/dev/null | head -n1 || true; }
+
 extract_tailscale_url() {
   local f="$1"
   grep -Eo 'https://login\.tailscale\.com/[a-zA-Z0-9/_-]+' "$f" 2>/dev/null | head -n1 || true
 }
 
-tailscale_ip4() { tailscale ip -4 2>/dev/null | head -n1 || true; }
-
 tailscale_apply() {
   hdr "🧠 Tailscale (early, hand-mode)"
   : >"$TS_LOG" 2>/dev/null || true
 
-  tailscale_install_if_needed
+  tailscale_install_if_needed || true
   tailscale_restart_daemon
 
-  # Run tailscale up like "native руками": show URL from its output.
+  # If already has IP, we're done
+  local already_ip=""
+  already_ip="$(tailscale_ip4)"
+  if [[ -n "${already_ip:-}" ]]; then
+    ok "tailscale already up (ip ${already_ip})"
+    TAILSCALE_READY="1"
+    return 0
+  fi
+
   local tmp="/tmp/tailscale-up.log"
   : >"$tmp" || true
 
   info "Running: tailscale up --ssh"
-  set +e
-  tailscale up --ssh 2>&1 | tee -a "$tmp" | tee -a "$TS_LOG"
-  local rc="${PIPESTATUS[0]}"
-  set -e
+  # Run in background so it won't hang the whole script under curl|bash
+  ( tailscale up --ssh >>"$tmp" 2>&1; echo "__TAILSCALE_UP_EXIT:$?" >>"$tmp" ) &
+  local up_pid=$!
 
-  if [[ "$rc" -ne 0 ]]; then
-    warn "tailscale up exited with code=$rc (continuing)."
-  else
-    ok "tailscale up finished"
-  fi
-
+  # Try to get URL quickly
   local url=""
-  url="$(extract_tailscale_url "$tmp")"
-  if [[ -n "${url:-}" ]]; then
+  for _ in {1..80}; do # ~8s
+    url="$(extract_tailscale_url "$tmp")"
+    [[ -n "$url" ]] && break
+    sleep 0.1
+  done
+
+  cat "$tmp" >>"$TS_LOG" 2>/dev/null || true
+
+  if [[ -n "$url" ]]; then
     echo
-    echo "🔗 Authenticate Tailscale:"
-    echo "   $url"
+    echo "To authenticate, visit:"
+    echo
+    echo "        $url"
     echo
   else
-    warn "Auth URL not found in tailscale output. If already authorized — that's fine."
-    warn "If not, run manually: tailscale up --ssh"
+    warn "Auth URL not found yet. If needed, run manually: tailscale up --ssh"
   fi
 
-  # Your rule: ask Enter ALWAYS if tailscale0 interface is missing
+  # Ask Enter ALWAYS if tailscale0 missing
   local need_enter="0"
   if ! ip link show tailscale0 >/dev/null 2>&1; then
     need_enter="1"
   fi
-  # Optional override: always ask if EDGE_TAILSCALE_REQUIRE_ENTER=1
+  # Additionally, force Enter if user wants it
   if [[ "${EDGE_TAILSCALE_REQUIRE_ENTER:-0}" == "1" ]]; then
-    need_enter="1"
-  fi
-  # Also if URL exists, it's usually authorization time (nice UX)
-  if [[ -n "${url:-}" ]]; then
     need_enter="1"
   fi
 
@@ -750,14 +730,23 @@ tailscale_apply() {
     read_tty _ "✅ Approved the device? Press Enter to continue… "
   fi
 
-  # One-shot sanity check (no waiting loops)
-  TAILSCALE_IP4="$(tailscale_ip4)"
-  if [[ -n "${TAILSCALE_IP4:-}" ]]; then
-    ok "tailscale ip -4: ${TAILSCALE_IP4}"
+  # Post-check (no long waits)
+  local ip=""
+  ip="$(tailscale_ip4)"
+  if [[ -n "${ip:-}" ]]; then
+    ok "tailscale ip -4: ${ip}"
     TAILSCALE_READY="1"
   else
     warn "tailscale ip -4 is empty right now. Continuing anyway."
     TAILSCALE_READY="0"
+  fi
+
+  # Don't block on tailscale up; just note
+  if kill -0 "$up_pid" 2>/dev/null; then
+    info "tailscale up is still running in background (pid=$up_pid)"
+  else
+    info "tailscale up finished"
+    cat "$tmp" >>"$TS_LOG" 2>/dev/null || true
   fi
 }
 
@@ -915,7 +904,6 @@ EOF_FZF
 
 zsh_apply_all_users() {
   hdr "💅 Zsh for all /home/* users"
-  aptq "Install zsh stack packages" install zsh git curl wget ca-certificates jq >/dev/null 2>&1 || true
 
   local homes=()
   while IFS= read -r -d '' d; do homes+=("$d"); done < <(find /home -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null || true)
@@ -948,65 +936,6 @@ ssh_harden_apply() {
 
   systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
   ok "SSH hardening applied"
-}
-
-###############################################################################
-# UFW firewall (VERY LAST)
-###############################################################################
-ufw_apply() {
-  hdr "🧱 Firewall (UFW) — LAST"
-
-  if ! command -v ufw >/dev/null 2>&1; then
-    aptq "Install UFW" install ufw
-  fi
-
-  backup_file /etc/default/ufw
-
-  if [[ -f /etc/default/ufw ]]; then
-    if grep -q '^DEFAULT_FORWARD_POLICY=' /etc/default/ufw; then
-      sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw || true
-    else
-      echo 'DEFAULT_FORWARD_POLICY="ACCEPT"' >> /etc/default/ufw
-    fi
-  fi
-
-  local internet_iface=""
-  internet_iface="$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -n1 || true)"
-  [[ -n "$internet_iface" ]] || internet_iface="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)"
-  [[ -n "$internet_iface" ]] || { warn "Cannot detect WAN iface; skipping UFW"; return 0; }
-
-  ufw --force reset >/dev/null 2>&1 || true
-  ufw default deny incoming >/dev/null 2>&1 || true
-  ufw default allow outgoing >/dev/null 2>&1 || true
-
-  if [[ "${ARG_OPEN_WAN_443}" == "1" ]]; then
-    ufw allow in on "$internet_iface" to any port 443 proto tcp >/dev/null 2>&1 || true
-    ufw allow in on "$internet_iface" to any port 443 proto udp >/dev/null 2>&1 || true
-    ok "WAN (${internet_iface}): allow 443/tcp, 443/udp"
-  else
-    warn "WAN (${internet_iface}): no inbound ports opened (open-wan-443=0)"
-  fi
-
-  if ip link show tailscale0 >/dev/null 2>&1; then
-    ufw allow in on tailscale0 >/dev/null 2>&1 || true
-    ufw allow out on tailscale0 >/dev/null 2>&1 || true
-    ok "Tailscale (tailscale0): allow all (in/out)"
-  else
-    warn "tailscale0 not found. (You can rerun UFW later after Tailscale is up.)"
-  fi
-
-  local docker_ifaces=""
-  docker_ifaces="$(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^(docker0|br-)/ {print $2}' || true)"
-  if [[ -n "$docker_ifaces" ]]; then
-    for ifc in $docker_ifaces; do
-      ufw allow in on "$ifc" >/dev/null 2>&1 || true
-      ufw allow out on "$ifc" >/dev/null 2>&1 || true
-    done
-    ok "Docker bridges: allow all (in/out)"
-  fi
-
-  ufw --force enable >/dev/null 2>&1 || true
-  ok "ufw enabled"
 }
 
 ###############################################################################
@@ -1138,7 +1067,7 @@ remnanode_status_line() {
 }
 
 ###############################################################################
-# Kernel/system tuning (tiered; reversible) — LATE
+# Kernel/system tuning (moved toward end; reversible)
 ###############################################################################
 HW_CPU="?"
 HW_RAM_MB="?"
@@ -1194,7 +1123,7 @@ net.ipv4.tcp_congestion_control=bbr
 net.netfilter.nf_conntrack_max=${ct_max}
 net.netfilter.nf_conntrack_buckets=${ct_buckets}
 
-# Conntrack timeouts
+# Conntrack timeouts (reduce long-lived dead entries; keep sane defaults)
 net.netfilter.nf_conntrack_tcp_timeout_established=7200
 net.netfilter.nf_conntrack_tcp_timeout_close_wait=60
 net.netfilter.nf_conntrack_tcp_timeout_fin_wait=60
@@ -1364,7 +1293,7 @@ EOF
 }
 
 tuning_apply() {
-  hdr "🛠️ System tuning (late)"
+  hdr "🛠️ System tuning"
 
   detect_hw_profile
   info "HW profile: profile=${HW_PROFILE}, tier=${HW_TIER} | CPU=${HW_CPU} | RAM=${HW_RAM_MB}MiB | disk(/var/log)=${HW_DISK_MB}MB"
@@ -1375,6 +1304,65 @@ tuning_apply() {
   apply_journald_limits
   apply_unattended_upgrades_policy
   apply_logrotate_varlog
+}
+
+###############################################################################
+# UFW firewall (MOVED TO VERY END)
+###############################################################################
+ufw_apply() {
+  hdr "🧱 Firewall (UFW)"
+
+  if ! command -v ufw >/dev/null 2>&1; then
+    aptq "Install UFW" install ufw
+  fi
+
+  backup_file /etc/default/ufw
+
+  if [[ -f /etc/default/ufw ]]; then
+    if grep -q '^DEFAULT_FORWARD_POLICY=' /etc/default/ufw; then
+      sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw || true
+    else
+      echo 'DEFAULT_FORWARD_POLICY="ACCEPT"' >> /etc/default/ufw
+    fi
+  fi
+
+  local internet_iface=""
+  internet_iface="$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -n1 || true)"
+  [[ -n "$internet_iface" ]] || internet_iface="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)"
+  [[ -n "$internet_iface" ]] || { warn "Cannot detect WAN iface; skipping UFW"; return 0; }
+
+  ufw --force reset >/dev/null 2>&1 || true
+  ufw default deny incoming >/dev/null 2>&1 || true
+  ufw default allow outgoing >/dev/null 2>&1 || true
+
+  if [[ "${ARG_OPEN_WAN_443}" == "1" ]]; then
+    ufw allow in on "$internet_iface" to any port 443 proto tcp >/dev/null 2>&1 || true
+    ufw allow in on "$internet_iface" to any port 443 proto udp >/dev/null 2>&1 || true
+    ok "WAN (${internet_iface}): allow 443/tcp, 443/udp"
+  else
+    warn "WAN (${internet_iface}): no inbound ports opened (open-wan-443=0)"
+  fi
+
+  if ip link show tailscale0 >/dev/null 2>&1; then
+    ufw allow in on tailscale0 >/dev/null 2>&1 || true
+    ufw allow out on tailscale0 >/dev/null 2>&1 || true
+    ok "Tailscale (tailscale0): allow all (in/out)"
+  else
+    warn "tailscale0 not found. (If you need it, authorize Tailscale first.)"
+  fi
+
+  local docker_ifaces=""
+  docker_ifaces="$(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^(docker0|br-)/ {print $2}' || true)"
+  if [[ -n "$docker_ifaces" ]]; then
+    for ifc in $docker_ifaces; do
+      ufw allow in on "$ifc" >/dev/null 2>&1 || true
+      ufw allow out on "$ifc" >/dev/null 2>&1 || true
+    done
+    ok "Docker bridges: allow all (in/out)"
+  fi
+
+  ufw --force enable >/dev/null 2>&1 || true
+  ok "ufw enabled"
 }
 
 ###############################################################################
@@ -1438,8 +1426,7 @@ apply_cmd() {
   mkbackup
   snapshot_before
 
-  # Hostname prompt early
-  hostname_apply
+  hostname_apply_interactive
 
   if [[ -z "${ARG_USER}" ]]; then
     read_tty ARG_USER "User to create/ensure (leave empty to skip): "
@@ -1469,16 +1456,16 @@ apply_cmd() {
     [[ "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_SSH_HARDEN="1" || ARG_SSH_HARDEN="0"
   fi
 
-  if [[ -z "${ARG_DNS_SWITCHER}" ]]; then
-    local a="n"
-    read_tty a "Run DNS switcher (late)? [y/N]: "
-    [[ "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_DNS_SWITCHER="1" || ARG_DNS_SWITCHER="0"
-  fi
-
   if [[ -z "${ARG_OPEN_WAN_443}" ]]; then
     local a="y"
-    read_tty a "Open WAN only 443 via UFW (LAST)? [Y/n]: "
+    read_tty a "Open WAN only 443 via UFW (at the end)? [Y/n]: "
     [[ -z "$a" || "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_OPEN_WAN_443="1" || ARG_OPEN_WAN_443="0"
+  fi
+
+  if [[ -z "${ARG_DNS_SWITCHER}" ]]; then
+    local a="n"
+    read_tty a "Run DNS switcher (near end)? [y/N]: "
+    [[ "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_DNS_SWITCHER="1" || ARG_DNS_SWITCHER="0"
   fi
 
   if [[ -z "${ARG_ZSH_ALL_USERS}" ]]; then
@@ -1534,22 +1521,20 @@ apply_cmd() {
     ssh_harden_apply
   fi
 
-  # Always enable iperf3 service
-  iperf3_server_apply
-
   if [[ "${ARG_REMNANODE}" == "1" ]]; then
     remnanode_apply
   fi
 
-  # LATE: kernel/system patches
+  # Moved toward end (your request)
   tuning_apply
 
-  # LATE: DNS patches
   if [[ "${ARG_DNS_SWITCHER}" == "1" ]]; then
     dns_apply
   fi
 
-  # VERY LAST: firewall
+  iperf3_server_apply
+
+  # UFW at the very end (your request)
   ufw_apply
 
   hdr "🧹 Autoremove"
@@ -1561,11 +1546,9 @@ apply_cmd() {
   print_before_after_all
   print_manifest_compact "$manifest"
 
-  local ts_ip ts_name
-  ts_ip="${TAILSCALE_IP4:-}"
-  ts_name=""
+  local ts_ip=""
   if command -v tailscale >/dev/null 2>&1; then
-    ts_name="$(tailscale status 2>/dev/null | awk 'NR==1{print $2}' | sed 's/^\(.*\)\.$/\1/' || true)"
+    ts_ip="$(tailscale_ip4)"
   fi
 
   local remna_line=""
@@ -1577,8 +1560,8 @@ apply_cmd() {
   row_kv "Geo"         "${GEO_CITY:-?}, ${GEO_REGION:-?}, ${GEO_CC:-?}"
   row_kv "Provider"    "${GEO_PROVIDER:-?}"
   if [[ -n "${ts_ip:-}" ]]; then row_kv "Tailscale IP" "${ts_ip}"; else row_kv "Tailscale IP" "-"; fi
-  if [[ -n "${ts_name:-}" ]]; then row_kv "MagicDNS" "${ts_name}"; else row_kv "MagicDNS" "-"; fi
   row_kv "HW profile"  "profile ${HW_PROFILE:-?}, tier ${HW_TIER:-?} | CPU ${HW_CPU:-?} | RAM ${HW_RAM_MB:-?} MiB | /var/log ${HW_DISK_MB:-?} MB"
+
   if [[ -n "${ARG_USER:-}" ]]; then
     if [[ "${USER_CREATED:-0}" == "1" ]]; then
       row_kv "User"      "${ARG_USER}"
@@ -1591,6 +1574,7 @@ apply_cmd() {
     row_kv "User"      "-"
     row_kv "Password"  "-"
   fi
+
   if [[ -n "${remna_line:-}" ]]; then
     row_kv "remnanode"  "${remna_line#remnanode }"
     row_kv "compose"    "/opt/remnanode/docker-compose.yml"
@@ -1598,6 +1582,7 @@ apply_cmd() {
     row_kv "remnanode"  "-"
     row_kv "compose"    "-"
   fi
+
   if [[ "${ARG_NODE_EXPORTER}" == "1" ]]; then
     row_kv "NodeExp log" "$NODE_EXPORTER_LOG"
   fi
@@ -1631,10 +1616,10 @@ apply_cmd() {
 
 4) tailscale
    tailscale status
+   ip -4 addr show tailscale0 || true
    tailscale ip -4 || true
-   ip link show tailscale0 || true
 
-5) firewall (applied last)
+5) firewall
    sudo ufw status verbose
 
 6) node exporter (if enabled)
