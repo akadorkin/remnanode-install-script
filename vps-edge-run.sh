@@ -182,7 +182,7 @@ country_flag() {
     cp1 = 0x1F1E6 + o1 - 65; cp2 = 0x1F1E6 + o2 - 65;
     printf "%c%c", cp1, cp2
   }
-  function ord(c){ return index("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c)+64 }'
+  function ord(c){ return index("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c)-1 + 65 }'
 }
 
 ext_ip() {
@@ -212,7 +212,7 @@ geo_lookup() {
 
   out="$(curl -fsSL --max-time 3 "http://ip-api.com/json/${ip}?fields=status,countryCode,country,regionName,city,as,isp,org" 2>/dev/null || true)"
   if [[ -n "$out" ]]; then
-    local status cc country region city as isp org
+    local status cc country region city as isp org provider
     status="$(printf "%s" "$out" | jq -r '.status // empty' 2>/dev/null || true)"
     if [[ "$status" == "success" ]]; then
       cc="$(printf "%s" "$out" | jq -r '.countryCode // empty' 2>/dev/null || true)"
@@ -222,7 +222,13 @@ geo_lookup() {
       as="$(printf "%s" "$out" | jq -r '.as // empty' 2>/dev/null || true)"
       isp="$(printf "%s" "$out" | jq -r '.isp // empty' 2>/dev/null || true)"
       org="$(printf "%s" "$out" | jq -r '.org // empty' 2>/dev/null || true)"
-      printf "%s|%s|%s|%s|%s" "${cc:-}" "${country:-}" "${region:-}" "${city:-}" "${as:-$org:-$isp}"
+
+      # FIX: safe "first non-empty"
+      provider="$as"
+      [[ -n "$provider" ]] || provider="$org"
+      [[ -n "$provider" ]] || provider="$isp"
+
+      printf "%s|%s|%s|%s|%s" "${cc:-}" "${country:-}" "${region:-}" "${city:-}" "${provider:-}"
       return 0
     fi
   fi
@@ -490,6 +496,10 @@ Flags (apply):
 
   --zsh-all-users 0|1          Ensure oh-my-zsh + p10k for all /home/* users + root (default: 1)
 
+Environment (advanced):
+  EDGE_ENABLE_GRO=1            Enable ethtool GRO + rx-udp-gro-forwarding tweaks (default: 0)
+                               WARNING: can break networking on some VPS/NICs.
+
 Notes:
   - Interactive prompts work even when piped (curl | sudo bash) because we read from /dev/tty.
   - Rollback restores files from MANIFEST and removes our extra drop-ins.
@@ -645,11 +655,19 @@ net.ipv4.conf.default.rp_filter=0
 EOF
   sysctl --system >>"$TS_LOG" 2>&1 || true
 
-  local internet_iface=""
-  internet_iface="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)"
-  if [[ -n "${internet_iface:-}" ]] && command -v ethtool >/dev/null 2>&1; then
-    ethtool -K "$internet_iface" gro on >>"$TS_LOG" 2>&1 || true
-    ethtool -K "$internet_iface" rx-udp-gro-forwarding on >>"$TS_LOG" 2>&1 || true
+  # SAFETY FIX:
+  # Some VPS/NICs behave badly with GRO/rx-udp-gro-forwarding.
+  # Enable only if EDGE_ENABLE_GRO=1
+  if [[ "${EDGE_ENABLE_GRO:-0}" == "1" ]]; then
+    local internet_iface=""
+    internet_iface="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)"
+    if [[ -n "${internet_iface:-}" ]] && command -v ethtool >/dev/null 2>&1; then
+      ethtool -K "$internet_iface" gro on >>"$TS_LOG" 2>&1 || true
+      ethtool -K "$internet_iface" rx-udp-gro-forwarding on >>"$TS_LOG" 2>&1 || true
+      ok "GRO tweaks enabled on ${internet_iface} (EDGE_ENABLE_GRO=1)"
+    fi
+  else
+    info "Skipping GRO tweaks (set EDGE_ENABLE_GRO=1 to enable)"
   fi
 }
 
@@ -794,12 +812,9 @@ node_exporter_apply() {
   hdr "📈 Node Exporter"
   : >"$NODE_EXPORTER_LOG" 2>/dev/null || true
 
-  # "Фоном": запускаем без ожидания интерактива и пишем лог.
-  # Внутри установщика может быть systemd enable/start — это ок.
   (
     set +e
     echo "[$(date -Is)] start: ${NODE_EXPORTER_INSTALL_CMD}"
-    # shellcheck disable=SC2090
     bash -c "${NODE_EXPORTER_INSTALL_CMD}"
     rc=$?
     echo "[$(date -Is)] done: rc=${rc}"
@@ -1014,6 +1029,15 @@ ufw_apply() {
   ufw default deny incoming >/dev/null 2>&1 || true
   ufw default allow outgoing >/dev/null 2>&1 || true
 
+  # SAFETY FIX:
+  # If tailscale is NOT enabled, do not accidentally lock yourself out from current SSH.
+  # (If tailscale is enabled+ready, you explicitly want WAN closed except 443.)
+  local ssh_port="${SSH_PORT:-22}"
+  if [[ "${ARG_TAILSCALE}" != "1" ]]; then
+    ufw allow in on "$internet_iface" to any port "$ssh_port" proto tcp >/dev/null 2>&1 || true
+    ok "WAN (${internet_iface}): allow SSH ${ssh_port}/tcp (tailscale=0 safety)"
+  fi
+
   if [[ "${ARG_OPEN_WAN_443}" == "1" ]]; then
     ufw allow in on "$internet_iface" to any port 443 proto tcp >/dev/null 2>&1 || true
     ufw allow in on "$internet_iface" to any port 443 proto udp >/dev/null 2>&1 || true
@@ -1202,14 +1226,12 @@ apply_sysctl_file() {
   local ct_max; ct_max="$(clamp "$ct_soft" 65536 1048576)"
   local ct_buckets; ct_buckets="$(clamp $(( ct_max / 4 )) 16384 262144)"
 
-  # tcp_max_tw_buckets: keep moderate to avoid memory blow-ups
   local tw_buckets
   if [[ "$HW_TIER" -le 2 ]]; then tw_buckets="200000"
   elif [[ "$HW_TIER" -le 8 ]]; then tw_buckets="500000"
   else tw_buckets="1000000"
   fi
 
-  # netdev backlog / somaxconn scaling
   local netdev_backlog somaxconn
   if [[ "$HW_TIER" -le 2 ]]; then netdev_backlog="16384"; somaxconn="8192"
   elif [[ "$HW_TIER" -le 8 ]]; then netdev_backlog="32768"; somaxconn="16384"
@@ -1220,40 +1242,32 @@ apply_sysctl_file() {
 # Managed by vps-edge-run.sh
 # Profile: ${HW_PROFILE} (tier=${HW_TIER}), CPU=${HW_CPU}, RAM=${HW_RAM_MB}MiB
 
-# Routing / forwarding
 net.ipv4.ip_forward=1
 
-# Queueing + congestion control
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 
-# Conntrack sizing (NAT / stateful firewall)
 net.netfilter.nf_conntrack_max=${ct_max}
 net.netfilter.nf_conntrack_buckets=${ct_buckets}
 
-# Conntrack timeouts (reduce long-lived dead entries; keep sane defaults)
 net.netfilter.nf_conntrack_tcp_timeout_established=7200
 net.netfilter.nf_conntrack_tcp_timeout_close_wait=60
 net.netfilter.nf_conntrack_tcp_timeout_fin_wait=60
 net.netfilter.nf_conntrack_tcp_timeout_time_wait=60
 
-# TCP hardening + keepalives
 net.ipv4.tcp_syncookies=1
 net.ipv4.tcp_rfc1337=1
 net.ipv4.tcp_keepalive_time=60
 net.ipv4.tcp_keepalive_intvl=10
 net.ipv4.tcp_keepalive_probes=6
 
-# Sockets/backlog
 net.core.somaxconn=${somaxconn}
 net.core.netdev_max_backlog=${netdev_backlog}
 net.ipv4.tcp_max_syn_backlog=8192
 net.ipv4.ip_local_port_range=10240 60999
 
-# TIME-WAIT bucket cap
 net.ipv4.tcp_max_tw_buckets=${tw_buckets}
 
-# Memory / swapping
 vm.swappiness=10
 EOF
 
@@ -1263,16 +1277,11 @@ EOF
 
 ensure_swapfile() {
   hdr "💾 Swap"
-  # if any swap already exists -> don't touch
   if /sbin/swapon --noheadings --show=NAME 2>/dev/null | grep -q .; then
     ok "swap already enabled: $(_swap_state)"
     return 0
   fi
 
-  # Decide swap size:
-  # - <=2GiB RAM: swap = RAM
-  # - 4..8GiB: swap = 2GiB
-  # - >=16GiB: swap = 4GiB
   local ram_gib swap_gib
   ram_gib="$(ceil_gib "$HW_RAM_MB")"
   if [[ "$ram_gib" -le 2 ]]; then
@@ -1340,7 +1349,6 @@ root soft nofile 1048576
 root hard nofile 1048576
 EOF
 
-  # Ensure pam_limits is included (Ubuntu/Debian)
   if [[ -f /etc/pam.d/common-session ]] && ! grep -qE '^\s*session\s+required\s+pam_limits\.so' /etc/pam.d/common-session; then
     echo "session required pam_limits.so" >> /etc/pam.d/common-session
   fi
@@ -1675,7 +1683,6 @@ apply_cmd() {
    sudo ufw status verbose
 
 6) node exporter (if enabled)
-   # depends on installer, usually:
    systemctl status node_exporter || systemctl status prometheus-node-exporter
    ss -lntp | grep -E ':9100\b' || true
 EOF
@@ -1697,7 +1704,6 @@ rollback_cmd() {
 
   snapshot_before
 
-  # Remove our managed drop-ins (they will also be restored if backed up)
   rm -f /etc/sysctl.d/99-edge.conf \
         /etc/sysctl.d/95-edge-tailscale.conf \
         /etc/systemd/system.conf.d/90-edge-nofile.conf \
