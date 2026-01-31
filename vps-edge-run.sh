@@ -12,8 +12,10 @@ set -Eeuo pipefail
 
 ###############################################################################
 # Goals (apply):
+# - Hostname prompt early (optional; Enter = keep current)
 # - DNS switcher (optional, early)
 # - Tailscale (optional, early; idempotent; safe waiting for Running+IPv4)
+#   * EDGE_TAILSCALE_REQUIRE_ENTER=1: ALWAYS require Enter after auth URL/QR
 # - Node Exporter install (optional; runs "in background" from script POV)
 # - Docker + remnanode (optional)
 # - Zsh stack for all /home/* users + root (optional-ish, enabled by default)
@@ -182,7 +184,7 @@ country_flag() {
     cp1 = 0x1F1E6 + o1 - 65; cp2 = 0x1F1E6 + o2 - 65;
     printf "%c%c", cp1, cp2
   }
-  function ord(c){ return index("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c)-1 + 65 }'
+  function ord(c){ return index("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c)+64 }'
 }
 
 ext_ip() {
@@ -212,7 +214,7 @@ geo_lookup() {
 
   out="$(curl -fsSL --max-time 3 "http://ip-api.com/json/${ip}?fields=status,countryCode,country,regionName,city,as,isp,org" 2>/dev/null || true)"
   if [[ -n "$out" ]]; then
-    local status cc country region city as isp org provider
+    local status cc country region city as isp org
     status="$(printf "%s" "$out" | jq -r '.status // empty' 2>/dev/null || true)"
     if [[ "$status" == "success" ]]; then
       cc="$(printf "%s" "$out" | jq -r '.countryCode // empty' 2>/dev/null || true)"
@@ -222,13 +224,7 @@ geo_lookup() {
       as="$(printf "%s" "$out" | jq -r '.as // empty' 2>/dev/null || true)"
       isp="$(printf "%s" "$out" | jq -r '.isp // empty' 2>/dev/null || true)"
       org="$(printf "%s" "$out" | jq -r '.org // empty' 2>/dev/null || true)"
-
-      # FIX: safe "first non-empty"
-      provider="$as"
-      [[ -n "$provider" ]] || provider="$org"
-      [[ -n "$provider" ]] || provider="$isp"
-
-      printf "%s|%s|%s|%s|%s" "${cc:-}" "${country:-}" "${region:-}" "${city:-}" "${provider:-}"
+      printf "%s|%s|%s|%s|%s" "${cc:-}" "${country:-}" "${region:-}" "${city:-}" "${as:-$org:-$isp}"
       return 0
     fi
   fi
@@ -432,6 +428,12 @@ P10K_URL="${P10K_URL:-https://raw.githubusercontent.com/akadorkin/remnanode-inst
 
 NODE_EXPORTER_INSTALL_CMD='bash <(curl -fsSL raw.githubusercontent.com/hteppl/sh/master/node_install.sh)'
 
+# If 1 -> ALWAYS require Enter after presenting AuthURL/QR, before we proceed waiting.
+EDGE_TAILSCALE_REQUIRE_ENTER="${EDGE_TAILSCALE_REQUIRE_ENTER:-0}"
+
+# Optional: enable GRO tweaks for WAN iface (you mentioned toggling this)
+EDGE_ENABLE_GRO="${EDGE_ENABLE_GRO:-0}"
+
 APT_LOG="/var/log/vps-edge-apt.log"
 DNS_LOG="/var/log/vps-edge-dns-switcher.log"
 TS_LOG="/var/log/vps-edge-tailscale.log"
@@ -496,9 +498,12 @@ Flags (apply):
 
   --zsh-all-users 0|1          Ensure oh-my-zsh + p10k for all /home/* users + root (default: 1)
 
-Environment (advanced):
-  EDGE_ENABLE_GRO=1            Enable ethtool GRO + rx-udp-gro-forwarding tweaks (default: 0)
-                               WARNING: can break networking on some VPS/NICs.
+Env:
+  EDGE_TAILSCALE_REQUIRE_ENTER=1
+      Always require pressing Enter after AuthURL/QR is shown (even if AuthURL is present).
+
+  EDGE_ENABLE_GRO=1
+      Enable GRO / rx-udp-gro-forwarding tweaks on WAN iface for Tailscale.
 
 Notes:
   - Interactive prompts work even when piped (curl | sudo bash) because we read from /dev/tty.
@@ -537,6 +542,46 @@ ensure_packages() {
 # Detect distro
 ###############################################################################
 is_debian_like() { command -v apt-get >/dev/null 2>&1; }
+
+###############################################################################
+# Hostname interactive (apply only)
+###############################################################################
+hostname_apply_interactive() {
+  hdr "🏷️ Hostname"
+  local cur new
+  cur="$(hostname 2>/dev/null || true)"
+  echo "Current: ${cur:-"(unknown)"}"
+
+  if ! _has_dev_tty; then
+    warn "No /dev/tty -> hostname prompt skipped"
+    return 0
+  fi
+
+  new=""
+  read_tty new "Enter new hostname (or press Enter to keep current): "
+  new="${new:-}"
+  if [[ -z "$new" ]]; then
+    ok "Hostname unchanged"
+    return 0
+  fi
+
+  if [[ ! "$new" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$ ]]; then
+    warn "Invalid hostname '${new}'. Allowed: letters/digits/hyphen, 1..63 chars. Skipping."
+    return 0
+  fi
+
+  backup_file /etc/hostname
+  backup_file /etc/hosts
+
+  if command -v hostnamectl >/dev/null 2>&1; then
+    hostnamectl set-hostname "$new" >>"$ERR_LOG" 2>&1 || true
+  else
+    echo "$new" > /etc/hostname
+    hostname "$new" >>"$ERR_LOG" 2>&1 || true
+  fi
+
+  ok "Hostname set to: $new"
+}
 
 ###############################################################################
 # Docker install (idempotent)
@@ -625,7 +670,7 @@ dns_apply() {
 }
 
 ###############################################################################
-# Tailscale (reliable AuthURL + reliable waiting)
+# Tailscale (reliable AuthURL + reliable waiting + require-enter option)
 ###############################################################################
 tailscale_install_if_needed() {
   : >"$TS_LOG" 2>/dev/null || true
@@ -655,19 +700,16 @@ net.ipv4.conf.default.rp_filter=0
 EOF
   sysctl --system >>"$TS_LOG" 2>&1 || true
 
-  # SAFETY FIX:
-  # Some VPS/NICs behave badly with GRO/rx-udp-gro-forwarding.
-  # Enable only if EDGE_ENABLE_GRO=1
-  if [[ "${EDGE_ENABLE_GRO:-0}" == "1" ]]; then
-    local internet_iface=""
-    internet_iface="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)"
-    if [[ -n "${internet_iface:-}" ]] && command -v ethtool >/dev/null 2>&1; then
-      ethtool -K "$internet_iface" gro on >>"$TS_LOG" 2>&1 || true
-      ethtool -K "$internet_iface" rx-udp-gro-forwarding on >>"$TS_LOG" 2>&1 || true
-      ok "GRO tweaks enabled on ${internet_iface} (EDGE_ENABLE_GRO=1)"
-    fi
-  else
+  if [[ "${EDGE_ENABLE_GRO:-0}" != "1" ]]; then
     info "Skipping GRO tweaks (set EDGE_ENABLE_GRO=1 to enable)"
+    return 0
+  fi
+
+  local internet_iface=""
+  internet_iface="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)"
+  if [[ -n "${internet_iface:-}" ]] && command -v ethtool >/dev/null 2>&1; then
+    ethtool -K "$internet_iface" gro on >>"$TS_LOG" 2>&1 || true
+    ethtool -K "$internet_iface" rx-udp-gro-forwarding on >>"$TS_LOG" 2>&1 || true
   fi
 }
 
@@ -726,6 +768,13 @@ tailscale_login_qr_emit() {
   local cmd=("tailscale" "login" "--qr")
   if command -v stdbuf >/dev/null 2>&1; then cmd=("stdbuf" "-oL" "-eL" "tailscale" "login" "--qr"); fi
   "${cmd[@]}" 2>&1 | tee -a "$TS_LOG" || true
+
+  # ALWAYS require Enter after QR/login step if we can.
+  if _has_dev_tty; then
+    read_tty _ "✅ Авторизовал устройство? Нажми Enter, чтобы продолжить… "
+  else
+    warn "No /dev/tty available -> can't wait for Enter; will keep waiting automatically."
+  fi
 }
 
 tailscale_wait_running_and_ipv4() {
@@ -770,20 +819,18 @@ tailscale_apply() {
   if [[ "$st" == "NeedsLogin" ]]; then
     url="$(tailscale_auth_url_json)"
     if [[ -n "${url:-}" ]]; then
-      echo; echo "🔗 Authenticate Tailscale in browser:"; echo "   $url"; echo
+      echo
+      echo "🔗 Authenticate Tailscale in browser:"
+      echo "   $url"
+      echo
+
+      # REQUIRE ENTER even if AuthURL is present (when EDGE_TAILSCALE_REQUIRE_ENTER=1)
+      if [[ "${EDGE_TAILSCALE_REQUIRE_ENTER:-0}" == "1" ]] && _has_dev_tty; then
+        read_tty _ "✅ Авторизовал устройство? Нажми Enter, чтобы продолжить… "
+      fi
     else
       warn "Tailscale needs login but AuthURL is empty -> running 'tailscale login --qr'"
       tailscale_login_qr_emit
-      url="$(tailscale_auth_url_json)"
-      if [[ -n "${url:-}" ]]; then
-        echo; echo "🔗 Authenticate Tailscale in browser:"; echo "   $url"; echo
-      fi
-    fi
-
-    if _has_dev_tty; then
-      read_tty _ "Press Enter AFTER you approve the device in Tailscale admin (or press Enter now, I'll keep waiting)… "
-    else
-      warn "No /dev/tty available. Will wait for approval automatically."
     fi
   else
     warn "Tailscale state=${st} -> trying 'tailscale up --ssh'"
@@ -815,6 +862,7 @@ node_exporter_apply() {
   (
     set +e
     echo "[$(date -Is)] start: ${NODE_EXPORTER_INSTALL_CMD}"
+    # shellcheck disable=SC2090
     bash -c "${NODE_EXPORTER_INSTALL_CMD}"
     rc=$?
     echo "[$(date -Is)] done: rc=${rc}"
@@ -1029,15 +1077,6 @@ ufw_apply() {
   ufw default deny incoming >/dev/null 2>&1 || true
   ufw default allow outgoing >/dev/null 2>&1 || true
 
-  # SAFETY FIX:
-  # If tailscale is NOT enabled, do not accidentally lock yourself out from current SSH.
-  # (If tailscale is enabled+ready, you explicitly want WAN closed except 443.)
-  local ssh_port="${SSH_PORT:-22}"
-  if [[ "${ARG_TAILSCALE}" != "1" ]]; then
-    ufw allow in on "$internet_iface" to any port "$ssh_port" proto tcp >/dev/null 2>&1 || true
-    ok "WAN (${internet_iface}): allow SSH ${ssh_port}/tcp (tailscale=0 safety)"
-  fi
-
   if [[ "${ARG_OPEN_WAN_443}" == "1" ]]; then
     ufw allow in on "$internet_iface" to any port 443 proto tcp >/dev/null 2>&1 || true
     ufw allow in on "$internet_iface" to any port 443 proto udp >/dev/null 2>&1 || true
@@ -1242,32 +1281,40 @@ apply_sysctl_file() {
 # Managed by vps-edge-run.sh
 # Profile: ${HW_PROFILE} (tier=${HW_TIER}), CPU=${HW_CPU}, RAM=${HW_RAM_MB}MiB
 
+# Routing / forwarding
 net.ipv4.ip_forward=1
 
+# Queueing + congestion control
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 
+# Conntrack sizing (NAT / stateful firewall)
 net.netfilter.nf_conntrack_max=${ct_max}
 net.netfilter.nf_conntrack_buckets=${ct_buckets}
 
+# Conntrack timeouts
 net.netfilter.nf_conntrack_tcp_timeout_established=7200
 net.netfilter.nf_conntrack_tcp_timeout_close_wait=60
 net.netfilter.nf_conntrack_tcp_timeout_fin_wait=60
 net.netfilter.nf_conntrack_tcp_timeout_time_wait=60
 
+# TCP hardening + keepalives
 net.ipv4.tcp_syncookies=1
 net.ipv4.tcp_rfc1337=1
 net.ipv4.tcp_keepalive_time=60
 net.ipv4.tcp_keepalive_intvl=10
 net.ipv4.tcp_keepalive_probes=6
 
+# Sockets/backlog
 net.core.somaxconn=${somaxconn}
 net.core.netdev_max_backlog=${netdev_backlog}
 net.ipv4.tcp_max_syn_backlog=8192
 net.ipv4.ip_local_port_range=10240 60999
 
+# TIME-WAIT bucket cap
 net.ipv4.tcp_max_tw_buckets=${tw_buckets}
 
+# Memory / swapping
 vm.swappiness=10
 EOF
 
@@ -1488,6 +1535,9 @@ apply_cmd() {
 
   mkbackup
   snapshot_before
+
+  # NEW: hostname prompt at the very beginning (interactive; Enter keeps current)
+  hostname_apply_interactive
 
   if [[ -z "${ARG_USER}" ]]; then
     read_tty ARG_USER "User to create/ensure (leave empty to skip): "
