@@ -1,260 +1,255 @@
-# 🚀 Awesome Remnanode VPS Edge Runner
+# ⭐ Awesome Remnanode VPS Edge Run
+
+A production-ready **VPS bootstrap & hardening script** for running **Remnanode (Remnawave VPN node)** securely behind **Tailscale**, with sane defaults, kernel tuning, DNS control, firewall lockdown, and a clean developer shell.
+
+This script is designed to be **idempotent**, **re-runnable**, and **reversible**.
+
+---
 
 ## TL;DR
 
-One command turns a fresh Ubuntu VPS into a **secure, Tailscale‑only edge node** ready for **Remnawave / remnanode**:
-
-- 🔒 Only **443** is open to the public Internet
-- 🌐 All control & services work **exclusively via Tailscale**
-- 🧠 Automatic **kernel & network tuning** based on CPU/RAM/Disk
-- 🌍 Predictable DNS via systemd‑resolved (Google + Cloudflare)
-- 🐳 Docker + remnanode bootstrapped and verified
-- 💅 Zsh + Powerlevel10k configured for **all users**
-- ♻️ Idempotent, repeatable, with **rollback support**
-
 ```bash
-curl -fsSL https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/vps-edge-run.sh \
-  | sudo bash -s -- apply --tailscale=1 --dns-switcher=1 --remnanode=1 --open-wan-443=1
+curl -fsSL https://raw.githubusercontent.com/akadorkin/remnanode-install-script/main/vps-edge-run.sh \
+| sudo bash -s -- apply \
+  --user admin \
+  --tailscale=1 \
+  --dns-switcher=1 --dns-profile=1 \
+  --remnanode=1 \
+  --ssh-harden=1 \
+  --open-wan-443=1
+```
+
+Result:
+- 🧠 Kernel tuned automatically (BBR, fq, conntrack, limits)
+- 🌐 DNS switched to Google + Cloudflare
+- 🔐 SSH hardened (no password auth)
+- 🧱 WAN closed except **443**
+- 🕸️ All services exposed **only via Tailscale**
+- 🧩 Remnanode running via Docker
+- 💅 Zsh + Powerlevel10k configured for all users
+
+---
+
+## What is this script for?
+
+`vps-edge-run.sh` prepares a **clean Ubuntu VPS** to act as a **Remnanode edge server** in the **Remnawave VPN ecosystem**.
+
+Key design principles:
+- Zero trust networking (Tailscale only)
+- Minimal WAN exposure (443/tcp,udp)
+- Safe kernel tuning based on hardware
+- Reversible changes (automatic backups)
+- Repeatable runs (idempotent)
+
+---
+
+## Architecture
+
+```
+[ Remnawave Panel ]
+        │
+        │  (Tailscale only)
+        ▼
+[ VPS / Remnanode ]
+   ├─ Docker
+   ├─ Remnanode
+   ├─ iperf3
+   ├─ SSH (key-only)
+   └─ Zsh dev shell
+
+WAN: 443 only
+Everything else: Tailscale
 ```
 
 ---
 
-## What is this?
+## Requirements
 
-`vps-edge-run.sh` is an **opinionated VPS bootstrap & hardening script**.
-
-It is designed for running **remnanode** (Remnawave VPN node) on a VPS, where:
-
-- the server must be reachable **only through Tailscale**
-- the public Internet sees **one port: 443**
-- the system is tuned for high‑throughput networking
-- the environment is comfortable for long‑term administration
-
-You can safely re‑run the script multiple times. It will not break an already configured host.
+- Ubuntu 20.04 / 22.04 / 24.04
+- Root access
+- **SSH key already installed for root** (`ssh-copy-id root@server`)
+  > Password auth will be disabled
 
 ---
 
-## Core components
+## Installed software
 
-### 🌐 DNS (systemd‑resolved)
+Always installed:
+- `docker`, `docker-compose-plugin`
+- `iptables`, `ufw`
+- `iperf3` (optional systemd server)
+- `git`, `jq`, `mc`, `curl`, `wget`
+- `zsh`, `powerlevel10k`, fonts
 
-Integrated DNS switcher based on:
-https://github.com/AndreyTimoschuk/dns-switcher
-
-Default profile (used automatically):
-
-- **DNS**: `8.8.8.8 8.8.4.4 1.1.1.1 1.0.0.1`
-- **Fallback**: `9.9.9.9`
-- `Domains=~.`
-
-Features:
-- non‑interactive (auto‑yes)
-- configuration backup
-- DNS summary + diagnostics hints
+Optional / conditional:
+- Tailscale
+- Remnanode
+- DNS switcher
 
 ---
 
-### 🧠 Tailscale (mandatory)
+## Kernel & system tuning
 
-Tailscale is the **backbone of the setup**.
+Kernel tuning is based on:
+👉 https://github.com/akadorkin/vps-network-tuning-script
 
-- Installed or reused if already present
-- `tailscale up` without exit‑node
-- Waits for successful online state
-- Detects:
-  - Tailscale IP (`100.x.x.x`)
-  - MagicDNS hostname (`node‑xxx.tailxxxx.ts.net`)
+Applied automatically based on:
+- RAM size
+- CPU count
+- Disk size
 
-All management traffic (SSH, remnanode, Docker, metrics) is expected to go through Tailscale.
+Includes:
+- BBR + fq
+- conntrack sizing
+- tcp_tw / keepalive tuning
+- file descriptor limits
+- journald caps
+- logrotate policy
 
-https://tailscale.com
+Profile is shown in final Summary output.
 
 ---
 
-### 🔐 Firewall model (UFW)
+## DNS Switcher
 
-Strict and predictable:
+Based on:
+👉 https://github.com/AndreyTimoschuk/dns-switcher
 
-- **WAN**:
-  - allow `443/tcp` and `443/udp`
-- **tailscale0**:
-  - allow all (in/out)
-- **Docker bridges**:
-  - allow internal traffic
+Default behavior:
+- Always auto-accept
+- Profile **1** by default
+
+Which means:
+- DNS: `8.8.8.8 8.8.4.4 1.1.1.1 1.0.0.1`
+- Fallback: `9.9.9.9`
+
+Backups stored in:
+```
+/etc/dns-switcher-backup
+```
+
+DNS summary is printed after apply.
+
+---
+
+## Tailscale
+
+- Installed and started early
+- No auth-key usage (web login only)
+- MagicDNS detected automatically
+- Exit nodes NOT enabled
+
+Used for:
+- Remnanode ↔ Remnawave Panel
+- SSH access
+- Metrics / iperf / admin tasks
+
+Docs:
+👉 https://tailscale.com
+
+---
+
+## Firewall model
+
+UFW rules:
+- WAN interface: **allow 443/tcp + 443/udp only**
+- `tailscale0`: allow all
+- Docker bridges: allow all
 
 Everything else is blocked.
 
 ---
 
-### 🧠 Kernel & network tuning
+## Zsh setup
 
-Based on:
-https://github.com/akadorkin/vps-network-tuning-script
+Applied to:
+- All users in `/home/*`
+- `root`
 
-Automatically derives a tuning profile from:
+Includes:
+- Oh-My-Zsh
+- Powerlevel10k theme
+- Clean prompt without update popups
+- Aliases & sane defaults
 
-- CPU count
-- RAM size
-- `/` filesystem size
+Files used:
+- `.zshrc`
+- `.p10k.zsh`
 
-Applies:
-
-- BBR + fq
-- conntrack sizing
-- TCP/UDP buffers
-- `nofile` limits
-- swapfile
-- journald limits
-- logrotate
-- disables unattended auto‑reboot
-
-A **Before → After** table is printed at the end.
+Fetched from this repo.
 
 ---
 
-### 🐳 Docker
+## Remnanode
 
-- Installed if missing
-- Reused if already present
-- Verified via `docker info`
+Remnanode is the VPN node component of **Remnawave**:
+👉 https://docs.rw
 
----
+Installation guide:
+👉 https://docs.rw/docs/install/remnawave-node
 
-### 🧩 remnanode (Remnawave node)
+Behavior:
+- If `/opt/remnanode/docker-compose.yml` exists → reused
+- Otherwise user is prompted for:
+  - Node port
+  - Secret key
 
-If `/opt/remnanode/docker-compose.yml` exists:
-- inputs are skipped
-- compose is started and verified
-
-Otherwise:
-- port and secret can be provided
-
-Documentation:
-- https://docs.rw
-- https://docs.rw/docs/install/remnawave-node
-
-⚠️ remnanode ↔ panel communication is expected **only via Tailscale**.
+Remnanode is started via Docker Compose.
 
 ---
 
-### 📡 iperf3
-
-- Always installed
-- systemd service always enabled
-- Useful for throughput tests over Tailscale
-
----
-
-### 💅 Zsh environment (all users)
-
-For **every user in `/home/*` and for `root`**:
-
-- Zsh is set as default shell
-- `.zshrc` is installed
-- Powerlevel10k prompt enabled
-- All update / wizard / popup prompts disabled
-
-#### What the provided `.zshrc` does
-
-- Enables sane history defaults
-- Disables Oh‑My‑Zsh auto‑update prompts
-- Loads Powerlevel10k instantly (no lag)
-- Adds useful aliases and completions
-- Keeps configuration **non‑interactive and silent**
-
-#### `p10k` configuration
-
-- Clean, minimal prompt
-- No context spam
-- Fast rendering (Instant Prompt)
-- Works well over SSH and Tailscale
-
-Both files are fetched from this repository via raw GitHub URLs.
-
----
-
-## Output summary
-
-At the end of execution you get a structured summary:
-
-- 🌍 WAN IP + country + city + provider
-- 🧠 Tailscale IP
-- ✨ MagicDNS hostname
-- 🧠 HW tuning profile (CPU / RAM / Disk)
-- 👤 User info
-- 🧩 remnanode container status
-- 📦 docker‑compose path
-- 📚 backup directory
-- 📝 log file locations
-
----
-
-## How to run
+## Usage
 
 ### Interactive (recommended first run)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/vps-edge-run.sh \
-  | sudo bash -s -- apply
+curl -fsSL https://raw.githubusercontent.com/akadorkin/remnanode-install-script/main/vps-edge-run.sh | sudo bash -s -- apply
 ```
 
-### Fully automated (no reboot)
+### Fully automated
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/vps-edge-run.sh \
-  | sudo bash -s -- apply \
-    --reboot=skip \
-    --tailscale=1 \
-    --dns-switcher=1 --dns-profile=1 \
-    --remnanode=1 \
-    --ssh-harden=1 \
-    --open-wan-443=1 \
-    --user akadorkin
+sudo ./vps-edge-run.sh apply \
+  --user admin \
+  --tailscale=1 \
+  --dns-switcher=1 --dns-profile=1 \
+  --remnanode=1 \
+  --ssh-harden=1 \
+  --open-wan-443=1 \
+  --reboot=skip
 ```
 
 ### Rollback
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/vps-edge-run.sh \
-  | sudo bash -s -- rollback
-```
-
-Or to a specific backup:
-
-```bash
-sudo BACKUP_DIR=/root/edge-tuning-backup-YYYYMMDD-HHMMSS bash vps-edge-run.sh rollback
+sudo ./vps-edge-run.sh rollback
 ```
 
 ---
 
-## Important notes
+## Final output
 
-- Requires **root**
-- Ubuntu **20.04+** recommended
-- Before running, ensure root SSH access via keys:
+At the end, the script prints:
+- WAN IP + Geo + Provider
+- Tailscale IP + MagicDNS
+- Hardware profile
+- Kernel tuning profile
+- Remnanode status
+- Backup location
+- Log files
 
-```bash
-ssh-copy-id root@your-server
-```
-
-Password authentication is disabled during hardening.
-
----
-
-## Philosophy
-
-- secure by default
-- minimal public attack surface
-- observable changes
-- safe to re‑run
-- boring, predictable infrastructure
+See `SUMMARY_EXAMPLE.md` for anonymized output.
 
 ---
 
-## Credits & references
+## License
 
-- DNS switcher: https://github.com/AndreyTimoschuk/dns-switcher
-- Tailscale: https://tailscale.com
-- Remnawave / remnanode: https://docs.rw
-- Network tuning base: https://github.com/akadorkin/vps-network-tuning-script
+GNU General Public License v3.0
 
+---
+
+## Why this exists
+
+Because setting this up **by hand** is boring, error-prone, and not repeatable.
+
+This script is what I actually run on real servers.
