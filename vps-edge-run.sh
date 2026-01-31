@@ -339,7 +339,6 @@ pick_log_caps() {
   fi
 }
 
-# Country flag from ISO2 (A-Z)
 country_flag() {
   local cc="${1:-}"
   cc="${cc^^}"
@@ -347,13 +346,15 @@ country_flag() {
     printf "🏳️"
     return 0
   fi
-  local o1 o2 cp1 cp2 esc
-  o1="$(printf '%d' "'${cc:0:1}")"
-  o2="$(printf '%d' "'${cc:1:1}")"
-  cp1=$((0x1F1E6 + o1 - 65))
-  cp2=$((0x1F1E6 + o2 - 65))
-  printf -v esc "\\U%08X\\U%08X" "$cp1" "$cp2"
-  printf "%b" "$esc"
+
+  awk -v cc="$cc" 'BEGIN{
+    o1 = ord(substr(cc,1,1))
+    o2 = ord(substr(cc,2,1))
+    cp1 = 0x1F1E6 + o1 - 65
+    cp2 = 0x1F1E6 + o2 - 65
+    printf "%s%s", sprintf("%c", cp1), sprintf("%c", cp2)
+  }
+  function ord(c){ return index("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c)+64 }'
 }
 
 ###############################################################################
