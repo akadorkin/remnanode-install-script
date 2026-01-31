@@ -10,7 +10,6 @@ set -Eeuo pipefail
 # -------------------------- Pretty logging --------------------------
 LOG_TS="${EDGE_LOG_TS:-1}"
 ts() { [[ "$LOG_TS" == "1" ]] && date +"%Y-%m-%d %H:%M:%S" || true; }
-_is_tty() { [[ -t 1 ]]; }
 
 c_reset=$'\033[0m'
 c_dim=$'\033[2m'
@@ -20,8 +19,8 @@ c_yel=$'\033[33m'
 c_grn=$'\033[32m'
 c_cyan=$'\033[36m'
 
-color() { local code="$1"; shift; if _is_tty; then printf "%s%s%s" "$code" "$*" "$c_reset"; else printf "%s" "$*"; fi; }
-_pfx() { _is_tty && printf "%s%s%s" "${c_dim}" "$(ts) " "${c_reset}" || true; }
+color() { local code="$1"; shift; printf "%s%s%s" "$code" "$*" "$c_reset"; }
+_pfx() { printf "%s%s%s" "${c_dim}" "$(ts) " "${c_reset}"; }
 
 ok()   { _pfx; color "$c_grn" "✅ OK";    printf " %s\n" "$*"; }
 info() { _pfx; color "$c_cyan" "ℹ️ ";     printf " %s\n" "$*"; }
@@ -37,13 +36,14 @@ need_root() {
   die "Not root. Use: curl ... | sudo bash -s -- apply ..."
 }
 
-# IMPORTANT:
-# - when started via pipe (curl | bash), stdin is NOT a tty.
-# - but /dev/tty usually exists under SSH and must be used for interactive prompts.
 read_tty() {
+  # Always read from /dev/tty if present (works even when stdin is a pipe)
   local __var="$1" __prompt="$2" __v=""
-  [[ -e /dev/tty ]] || { printf -v "$__var" '%s' ""; return 0; }
-  read -rp "$__prompt" __v </dev/tty || true
+  if [[ -e /dev/tty ]]; then
+    read -rp "$__prompt" __v </dev/tty || true
+  else
+    __v=""
+  fi
   printf -v "$__var" '%s' "$__v"
 }
 
@@ -109,7 +109,6 @@ L_SSH="${LOG_DIR}/vps-edge-ssh.log"
 L_REMNA="${LOG_DIR}/vps-edge-remnanode.log"
 L_KERNEL="${LOG_DIR}/vps-edge-tuning.log"
 L_HOSTNAME="${LOG_DIR}/vps-edge-hostname.log"
-
 touch "$L_APT" "$L_DNS" "$L_TS" "$L_USER" "$L_ZSH" "$L_UFW" "$L_SSH" "$L_REMNA" "$L_KERNEL" "$L_HOSTNAME" 2>/dev/null || true
 
 ASSETS_TMP="/tmp/vps-edge-assets"
@@ -213,62 +212,66 @@ remnanode_logrotate_policy() {
   fi
 }
 
-# -------------------------- Asset runner (SHOW LIVE OUTPUT + LOG) --------------------------
-# Key point: even when script is started via pipe, we want:
-# - asset output visible in console
-# - prompts/reads work via /dev/tty
-run_asset() {
+# -------------------------- Asset runner --------------------------
+_run_asset_common() {
   local name="$1" url="$2" log_file="$3"
   local tmp="${ASSETS_TMP}/${name}.sh"
 
-  hdr "▶️  ${name}"
-  echo "Log: ${log_file}"
-  echo
+  info "Running asset: ${name}"
+  : >"$log_file" || true
 
-  if ! curl -fsSL "$url" -o "$tmp" 2>/dev/null; then
+  if ! curl -fsSL "$url" -o "$tmp" >>"$log_file" 2>&1; then
     warn "${name} download failed: ${url}"
     return 2
   fi
-  chmod +x "$tmp" 2>/dev/null || true
+  chmod +x "$tmp" >>"$log_file" 2>&1 || true
 
-  # don't wipe logs each run; append
-  echo "----- $(ts) RUN ${name} -----" >>"$log_file"
+  echo "$tmp"
+}
 
+run_asset() {
+  local name="$1" url="$2" log_file="$3"
+  local tmp
+  tmp="$(_run_asset_common "$name" "$url" "$log_file")" || return $?
   set +e
-  if [[ -e /dev/tty ]]; then
-    # Interactive-friendly: stdin from tty, show live output, log it too
-    bash "$tmp" </dev/tty > >(tee -a "$log_file") 2> >(tee -a "$log_file" >&2)
-  else
-    # No tty (rare): still show output and log it
-    bash "$tmp" 2>&1 | tee -a "$log_file"
-  fi
+  bash "$tmp" 2>&1 | tee -a "$log_file"
   local rc=${PIPESTATUS[0]}
   set -e
-
   [[ $rc -eq 0 ]] && ok "${name} finished" || warn "${name} exited with code=${rc} (see ${log_file})"
   return "$rc"
 }
 
 run_asset_with_stdin() {
   local name="$1" url="$2" log_file="$3" stdin_payload="$4"
-  local tmp="${ASSETS_TMP}/${name}.sh"
-
-  hdr "▶️  ${name}"
-  echo "Log: ${log_file}"
-  echo
-
-  if ! curl -fsSL "$url" -o "$tmp" 2>/dev/null; then
-    warn "${name} download failed: ${url}"
-    return 2
-  fi
-  chmod +x "$tmp" 2>/dev/null || true
-
-  echo "----- $(ts) RUN ${name} (stdin-fed) -----" >>"$log_file"
-
+  local tmp
+  tmp="$(_run_asset_common "$name" "$url" "$log_file")" || return $?
   set +e
-  # Feed stdin payload; still show output live and log it.
   printf "%b" "$stdin_payload" | bash "$tmp" 2>&1 | tee -a "$log_file"
   local rc=${PIPESTATUS[1]}
+  set -e
+  [[ $rc -eq 0 ]] && ok "${name} finished" || warn "${name} exited with code=${rc} (see ${log_file})"
+  return "$rc"
+}
+
+run_asset_tty() {
+  # For interactive assets (tailscale, hostname, anything that needs /dev/tty)
+  local name="$1" url="$2" log_file="$3"
+  local tmp
+  tmp="$(_run_asset_common "$name" "$url" "$log_file")" || return $?
+
+  if [[ ! -e /dev/tty ]]; then
+    warn "${name}: /dev/tty not available — running non-tty mode"
+    set +e
+    bash "$tmp" 2>&1 | tee -a "$log_file"
+    local rc=${PIPESTATUS[0]}
+    set -e
+    [[ $rc -eq 0 ]] && ok "${name} finished" || warn "${name} exited with code=${rc} (see ${log_file})"
+    return "$rc"
+  fi
+
+  set +e
+  bash "$tmp" </dev/tty 2>&1 | tee -a "$log_file"
+  local rc=${PIPESTATUS[0]}
   set -e
 
   [[ $rc -eq 0 ]] && ok "${name} finished" || warn "${name} exited with code=${rc} (see ${log_file})"
@@ -386,15 +389,15 @@ print_summary() {
 
   echo "✅ Steps"
   echo "  🖥️  Hostname     : $([[ $S_HOSTNAME -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_HOSTNAME)")"
-  echo "  📦 Packages      : $([[ $S_APT -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_APT)")"
-  echo "  🌐 DNS switcher  : $([[ $S_DNS -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_DNS)")"
-  echo "  🧠 Tailscale     : $([[ $S_TS -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_TS)")"
-  echo "  👤 User setup    : $([[ $S_USER -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_USER)")"
-  echo "  💅 Zsh           : $([[ $S_ZSH -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_ZSH)")"
-  echo "  🧱 UFW           : $([[ $S_UFW -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_UFW)")"
-  echo "  🔐 SSH/Fail2ban  : $([[ $S_SSH -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_SSH)")"
-  echo "  🧩 remnanode     : $([[ $S_REMNA -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_REMNA)")"
-  echo "  🧠 Kernel tune   : $([[ $S_KERNEL -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_KERNEL)")"
+  echo "  📦 Packages     : $([[ $S_APT -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_APT)")"
+  echo "  🌐 DNS switcher : $([[ $S_DNS -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_DNS)")"
+  echo "  🧠 Tailscale    : $([[ $S_TS -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_TS)")"
+  echo "  👤 User setup   : $([[ $S_USER -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_USER)")"
+  echo "  💅 Zsh          : $([[ $S_ZSH -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_ZSH)")"
+  echo "  🧱 UFW          : $([[ $S_UFW -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_UFW)")"
+  echo "  🔐 SSH/Fail2ban : $([[ $S_SSH -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_SSH)")"
+  echo "  🧩 remnanode    : $([[ $S_REMNA -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_REMNA)")"
+  echo "  🧠 Kernel tune  : $([[ $S_KERNEL -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_KERNEL)")"
   echo
 
   echo "📄 Logs"
@@ -433,8 +436,9 @@ EOF
 apply_cmd() {
   need_root "$@"
 
-  # Hostname (always interactive via /dev/tty, even under pipe)
-  if run_asset "hostname-bootstrap" "$ASSET_HOSTNAME" "$L_HOSTNAME"; then S_HOSTNAME=0; else S_HOSTNAME=$?; fi
+  # Hostname asset (interactive-only)
+  hdr "🖥️  Hostname"
+  if run_asset_tty "hostname-bootstrap" "$ASSET_HOSTNAME" "$L_HOSTNAME"; then S_HOSTNAME=0; else S_HOSTNAME=$?; fi
 
   timezone_apply
 
@@ -443,29 +447,36 @@ apply_cmd() {
   echo
 
   # APT
+  hdr "📦 Packages"
   if run_asset "apt-bootstrap" "$ASSET_APT" "$L_APT"; then S_APT=0; else S_APT=$?; fi
 
   # DNS
   if [[ "${ARG_DNS_SWITCHER}" == "1" ]]; then
-    # If dns-profile provided -> auto-feed y + profile into the asset (no prompts)
+    hdr "🌐 DNS switcher"
     if [[ -n "${ARG_DNS_PROFILE:-}" && "${ARG_DNS_PROFILE}" =~ ^[1-5]$ ]]; then
       if run_asset_with_stdin "dns-bootstrap" "$ASSET_DNS" "$L_DNS" $'y\n'"${ARG_DNS_PROFILE}"$'\n'; then
         S_DNS=0
       else
         S_DNS=$?
       fi
+      ok "dns-switcher auto-applied (profile ${ARG_DNS_PROFILE}) (see $L_DNS)"
     else
-      if run_asset "dns-bootstrap" "$ASSET_DNS" "$L_DNS"; then S_DNS=0; else S_DNS=$?; fi
+      if run_asset_tty "dns-bootstrap" "$ASSET_DNS" "$L_DNS"; then S_DNS=0; else S_DNS=$?; fi
+      ok "dns-switcher applied (interactive) (see $L_DNS)"
     fi
   fi
 
-  # Tailscale
+  # Tailscale (MUST be tty)
   if [[ "${ARG_TAILSCALE}" == "1" ]]; then
-    if run_asset "tailscale-bootstrap" "$ASSET_TAILSCALE" "$L_TS"; then S_TS=0; else S_TS=$?; fi
+    hdr "🧠 Tailscale"
+    if run_asset_tty "tailscale-bootstrap" "$ASSET_TAILSCALE" "$L_TS"; then S_TS=0; else S_TS=$?; fi
+    ok "tailscale ip: $(tailscale_ip4 || true)"
+    ok "MagicDNS: $(tailscale_dnsname || true)"
   fi
 
   # User
   if [[ -n "${ARG_USER:-}" ]]; then
+    hdr "👤 User setup"
     export USER_NAME="${ARG_USER}"
     if run_asset "user-setup" "$ASSET_USER" "$L_USER"; then
       S_USER=0
@@ -478,30 +489,34 @@ apply_cmd() {
   fi
 
   # Zsh
+  hdr "💅 Zsh"
   if run_asset "zsh-bootstrap" "$ASSET_ZSH" "$L_ZSH"; then S_ZSH=0; else S_ZSH=$?; fi
 
   # Kernel tuning (do not stop on non-zero)
+  hdr "🧠 Kernel + system tuning"
   if run_asset "kernel-bootstrap" "$ASSET_KERNEL" "$L_KERNEL"; then
     S_KERNEL=0
   else
     S_KERNEL=$?
-    warn "kernel tuning returned rc=$S_KERNEL — continuing"
+    warn "kernel tuning returned rc=$S_KERNEL (see $L_KERNEL) — continuing"
   fi
 
   # UFW
   if [[ "${ARG_OPEN_WAN_443}" == "1" || "${ARG_TAILSCALE}" == "1" ]]; then
+    hdr "🧱 UFW"
     export OPEN_WAN_443="${ARG_OPEN_WAN_443}"
-    export ENABLE_TAILSCALE="${ARG_TAILSCALE}"
     if run_asset "ufw-bootstrap" "$ASSET_UFW" "$L_UFW"; then S_UFW=0; else S_UFW=$?; fi
   fi
 
   # SSH / fail2ban / recidive
   if [[ "${ARG_SSH_HARDEN}" == "1" ]]; then
+    hdr "🔐 SSH hardening + fail2ban"
     if run_asset "ssh-bootstrap" "$ASSET_SSH" "$L_SSH"; then S_SSH=0; else S_SSH=$?; fi
   fi
 
   # remnanode
   if [[ "${ARG_REMNANODE}" == "1" ]]; then
+    hdr "🧩 remnanode"
     if run_asset "remnanode-bootstrap" "$ASSET_REMNANODE" "$L_REMNA"; then S_REMNA=0; else S_REMNA=$?; fi
   fi
 
