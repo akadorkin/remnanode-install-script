@@ -1064,14 +1064,13 @@ remnanode_collect_inputs_early() {
     return 0
   fi
 
-  # Need inputs but no TTY -> fail (avoid silent skip)
+  # Need inputs but no TTY -> DO NOT FAIL, just skip remnanode compose
   if [[ ! -t 0 ]]; then
-    err "remnanode=1 but compose is missing and no interactive TTY to ask for NODE_PORT/SECRET_KEY."
-    echo
-    echo "Fix: run from interactive SSH/console OR preseed env:"
-    echo "  NODE_PORT=2222 SECRET_KEY='...' sudo -E ./vps-edge-run.sh apply --remnanode=1"
-    echo
-    die "Refusing to continue without remnanode inputs."
+    warn "remnanode=1 but compose missing and no TTY to ask for NODE_PORT/SECRET_KEY -> skipping remnanode compose creation."
+    warn "To enable remnanode in non-interactive mode, pass env vars:"
+    warn "  NODE_PORT=2222 SECRET_KEY='...' curl ... | sudo -E bash -s -- apply --remnanode=1"
+    SKIP_REMNANODE_INPUTS="1"
+    return 0
   fi
 
   hdr "🧩 remnanode inputs (early)"
@@ -1083,12 +1082,17 @@ remnanode_collect_inputs_early() {
 
   local key="${SECRET_KEY:-}"
   read_tty_silent key "Paste SECRET_KEY (input hidden): "
-  [[ -n "$key" ]] || die "SECRET_KEY is empty. remnanode=1 requires SECRET_KEY when compose is missing."
+  if [[ -z "$key" ]]; then
+    warn "SECRET_KEY empty -> remnanode compose will not be created."
+    SKIP_REMNANODE_INPUTS="1"
+    return 0
+  fi
   SECRET_KEY="$key"
 
   ok "remnanode params collected"
   SKIP_REMNANODE_INPUTS="0"
 }
+
 
 remnanode_apply() {
   hdr "🧩 remnanode"
