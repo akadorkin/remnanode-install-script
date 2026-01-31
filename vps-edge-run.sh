@@ -10,10 +10,6 @@ set -Eeuo pipefail
 # - Kernel/system tuning with backup+rollback (tiered)
 # - UFW: WAN only 443 (optional), Tailscale allow-all, Docker bridges allow-all
 # - iperf3 installed always + systemd server enabled always
-#
-# SAFETY:
-# - If tailscale=1 but not authenticated/up, UFW will be SKIPPED to avoid lockout.
-# - remnanode=1 requires NODE_PORT + SECRET_KEY if compose missing (interactive or env).
 ###############################################################################
 
 ###############################################################################
@@ -22,6 +18,7 @@ set -Eeuo pipefail
 LOG_TS="${EDGE_LOG_TS:-1}"
 ts() { [[ "$LOG_TS" == "1" ]] && date +"%Y-%m-%d %H:%M:%S" || true; }
 _is_tty() { [[ -t 1 ]]; }
+_has_dev_tty() { [[ -r /dev/tty && -w /dev/tty ]]; }
 
 c_reset=$'\033[0m'
 c_dim=$'\033[2m'
@@ -69,19 +66,31 @@ need_root() {
 
 ###############################################################################
 # TTY input helpers
+# IMPORTANT: must work even when script is piped (curl | sudo bash).
+# We read from /dev/tty when available.
 ###############################################################################
 read_tty() {
   local __var="$1" __prompt="$2" __v=""
-  [[ -t 0 ]] || { printf -v "$__var" '%s' ""; return 0; }
-  read -rp "$__prompt" __v </dev/tty || true
-  printf -v "$__var" '%s' "$__v"
+  if _has_dev_tty; then
+    read -rp "$__prompt" __v </dev/tty || true
+    printf -v "$__var" '%s' "$__v"
+    return 0
+  fi
+  # no tty available (non-interactive)
+  printf -v "$__var" '%s' ""
+  return 0
 }
+
 read_tty_silent() {
   local __var="$1" __prompt="$2" __v=""
-  [[ -t 0 ]] || { printf -v "$__var" '%s' ""; return 0; }
-  read -rsp "$__prompt" __v </dev/tty || true
-  echo >/dev/tty || true
-  printf -v "$__var" '%s' "$__v"
+  if _has_dev_tty; then
+    read -rsp "$__prompt" __v </dev/tty || true
+    echo >/dev/tty || true
+    printf -v "$__var" '%s' "$__v"
+    return 0
+  fi
+  printf -v "$__var" '%s' ""
+  return 0
 }
 
 ###############################################################################
@@ -193,7 +202,7 @@ geo_lookup() {
   # Outputs: COUNTRY_CODE|COUNTRY|REGION|CITY|ORG
   local ip="${1:-}"
   local out=""
-
+  # ipinfo (no key)
   out="$(curl -fsSL --max-time 3 "https://ipinfo.io/${ip}/json" 2>/dev/null || true)"
   if [[ -n "$out" ]]; then
     local cc country region city org
@@ -208,6 +217,7 @@ geo_lookup() {
     fi
   fi
 
+  # ip-api fallback
   out="$(curl -fsSL --max-time 3 "http://ip-api.com/json/${ip}?fields=status,countryCode,country,regionName,city,as,isp,org" 2>/dev/null || true)"
   if [[ -n "$out" ]]; then
     local status cc country region city as isp org
@@ -352,6 +362,8 @@ tier_max() {
   if [[ "$ra" -ge "$rb" ]]; then echo "$a"; else echo "$b"; fi
 }
 
+# Conntrack soft formula:
+# ct_soft = RAM_MiB * 64 + CPU * 8192
 ct_soft_from_ram_cpu() {
   local mem_mb="$1" cpu="$2"
   local ct=$(( mem_mb * 64 + cpu * 8192 ))
@@ -436,6 +448,7 @@ print_manifest_compact() {
 ###############################################################################
 CMD="${1:-}"; shift || true
 
+# Defaults: interactive unless explicitly provided
 ARG_USER=""
 ARG_TIMEZONE="Europe/Moscow"
 ARG_REBOOT="5m"
@@ -447,9 +460,10 @@ ARG_REMNANODE=""         # 0/1, if empty -> interactive
 ARG_SSH_HARDEN=""        # 0/1, if empty -> interactive
 ARG_OPEN_WAN_443=""      # 0/1, if empty -> interactive
 
-# remnanode inputs (can be preseeded via env)
+# remnanode inputs (asked early if needed)
 NODE_PORT="${NODE_PORT:-}"
 SECRET_KEY="${SECRET_KEY:-}"
+SKIP_REMNANODE_INPUTS="0"
 
 # URLs
 DNS_SWITCHER_URL="${DNS_SWITCHER_URL:-https://raw.githubusercontent.com/AndreyTimoschuk/dns-switcher/main/dns-switcher.sh}"
@@ -467,6 +481,7 @@ ERR_LOG="/var/log/vps-edge-error.log"
 
 touch "$APT_LOG" "$DNS_LOG" "$TS_LOG" "$DOCKER_LOG" "$ERR_LOG" 2>/dev/null || true
 
+# Parse flags after command
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --user=*)          ARG_USER="${1#*=}"; shift ;;
@@ -513,15 +528,14 @@ Flags (apply):
   --tailscale 0|1              Install/up tailscale early (no exit-node, no auth key)
   --remnanode 0|1              Ensure /opt/remnanode + compose + start container
   --ssh-harden 0|1             PasswordAuthentication no, PermitRootLogin no
-  --open-wan-443 0|1           WAN UFW allow only 443 (tcp+udp). Tailscale allow-all always when enabled
+  --open-wan-443 0|1           WAN UFW allow only 443 (tcp+udp). Tailscale allow-all is mandatory when enabled.
 
-Env (optional preseed):
-  NODE_PORT=2222
-  SECRET_KEY='...'
+Notes:
+  - Interactive prompts work even when piped (curl | sudo bash) because we read from /dev/tty.
 
 Examples:
   sudo ./vps-edge-run.sh apply
-  NODE_PORT=2222 SECRET_KEY='...' sudo -E ./vps-edge-run.sh apply --reboot=skip --tailscale=1 --remnanode=1
+  sudo ./vps-edge-run.sh apply --reboot=skip --tailscale=1 --dns-switcher=1 --dns-profile=1 --remnanode=1 --ssh-harden=1 --open-wan-443=1 --user admin
 EOF
 }
 
@@ -640,17 +654,12 @@ dns_apply() {
   echo "Now:"
   resolvectl status 2>/dev/null | grep -E "DNS Servers|DNS Domain|Fallback DNS" || true
   echo
-  echo "Tips:"
-  echo "  - Monitor DNS queries:"
-  echo "      sudo tcpdump -i any port 53 -n -Q out"
-  echo "  - Verify after reboot:"
-  echo "      sudo resolvectl status | grep -E \"DNS Servers|DNS Domain\""
   echo "Backups:"
   echo "  - /etc/dns-switcher-backup"
 }
 
 ###############################################################################
-# Tailscale (idempotent; no exit-node; no auth key; no reset)
+# Tailscale (idempotent; must end with a working IPv4 on tailscale0)
 ###############################################################################
 tailscale_install_if_needed() {
   if command -v tailscale >/dev/null 2>&1; then
@@ -663,6 +672,11 @@ tailscale_install_if_needed() {
   else
     warn "tailscale install failed (see $TS_LOG)"
   fi
+}
+
+tailscale_restart_daemon() {
+  systemctl enable --now tailscaled >/dev/null 2>&1 || true
+  systemctl restart tailscaled >/dev/null 2>&1 || true
 }
 
 tailscale_sysctl_tune() {
@@ -694,45 +708,40 @@ tailscale_magicdns_name() {
   echo "$name"
 }
 
+tailscale_is_up() {
+  tailscale status >/dev/null 2>&1
+}
+
 tailscale_ip4() {
   tailscale ip -4 2>/dev/null | head -n1 || true
 }
 
-tailscale_backend_state() {
-  tailscale status --json 2>/dev/null | jq -r '.BackendState // empty' 2>/dev/null || true
+tailscale_iface_has_ipv4() {
+  ip -4 addr show dev tailscale0 2>/dev/null | grep -qE '\binet\s' && return 0
+  return 1
 }
 
-tailscale_needs_login() {
-  # BackendState often: NeedsLogin / Running / Stopped / NoState
-  local st=""
-  st="$(tailscale_backend_state)"
-  [[ "$st" == "NeedsLogin" ]]
+tailscale_need_reinstall() {
+  # Your signal: tailscale0 exists, but only has IPv6 link-local (no IPv4).
+  if ip link show tailscale0 >/dev/null 2>&1; then
+    if ! tailscale_iface_has_ipv4; then
+      return 0
+    fi
+  fi
+  return 1
 }
 
-tailscale_is_running_with_ip() {
-  local ip=""
-  ip="$(tailscale_ip4)"
-  [[ -n "$ip" ]]
-}
-
-tailscale_apply() {
-  hdr "🧠 Tailscale (early)"
-  tailscale_install_if_needed
-  tailscale_sysctl_tune
-
-  systemctl enable --now tailscaled >/dev/null 2>&1 || true
-
-  # If already has IP, treat as up
-  if tailscale_is_running_with_ip; then
-    local ip name
-    ip="$(tailscale_ip4)"
-    ok "tailscale is up (ip ${ip})"
-    name="$(tailscale_magicdns_name)"
-    [[ -n "$name" ]] && ok "MagicDNS: ${name}" || warn "MagicDNS name not available (maybe disabled)."
+tailscale_reinstall_if_broken() {
+  if ! tailscale_need_reinstall; then
     return 0
   fi
+  warn "tailscale0 has no IPv4 (looks broken) -> reinstalling tailscale first"
+  : >"$TS_LOG" || true
+  aptq "Reinstall tailscale" install --reinstall tailscale || true
+  tailscale_restart_daemon
+}
 
-  # If needs login (or no IP), run tailscale up --ssh and extract auth link if present
+tailscale_up_with_auth() {
   : >"$TS_LOG" || true
   local out="/tmp/vps-edge-tailscale-up.log"
   rm -f "$out" 2>/dev/null || true
@@ -742,45 +751,88 @@ tailscale_apply() {
   local rc=${PIPESTATUS[0]}
   set -e
 
-  if [[ "$rc" -ne 0 ]]; then
-    warn "tailscale up returned rc=${rc}. See: $TS_LOG"
-  fi
-
+  # Try to extract auth URL (when not logged in)
   local url=""
   url="$(grep -Eo 'https://login\.tailscale\.com/[a-zA-Z0-9/_-]+' "$out" | head -n1 || true)"
+
   if [[ -n "$url" ]]; then
     echo
     echo "🔗 Authenticate Tailscale in browser:"
     echo "   $url"
     echo
-    read_tty _ "Press Enter after you approve the device in Tailscale admin… "
-  else
-    # If still no IP and no URL, explicitly tell user what to do
-    if tailscale_needs_login; then
-      warn "Tailscale still needs login but auth URL not detected from output."
-      echo "Run manually to get the link:"
-      echo "  sudo tailscale up --ssh"
-      echo
-      read_tty _ "Press Enter after you finish Tailscale auth (or to continue)… "
+    if _has_dev_tty; then
+      read_tty _ "Press Enter after you approve the device in Tailscale admin… "
+    else
+      warn "No /dev/tty available to wait for confirmation."
     fi
   fi
 
-  local ip=""
-  for _i in {1..30}; do
+  return "$rc"
+}
+
+tailscale_apply() {
+  hdr "🧠 Tailscale (early)"
+  tailscale_install_if_needed
+  tailscale_restart_daemon
+  tailscale_sysctl_tune
+
+  # If interface exists but is broken -> reinstall first
+  tailscale_reinstall_if_broken
+
+  # If already up and has IPv4 -> OK
+  if tailscale_is_up && tailscale_iface_has_ipv4; then
+    local ip name
     ip="$(tailscale_ip4)"
-    [[ -n "$ip" ]] && break
+    [[ -n "$ip" ]] && ok "tailscale is up (ip ${ip})" || ok "tailscale is up"
+    name="$(tailscale_magicdns_name)"
+    [[ -n "$name" ]] && ok "MagicDNS: ${name}" || warn "MagicDNS name not available (maybe disabled)."
+    return 0
+  fi
+
+  # Not up / not healthy -> try tailscale up (with auth URL + confirmation)
+  tailscale_up_with_auth || true
+
+  # Wait for IPv4 on tailscale0 (critical for "SSH over Tailscale must work")
+  local ip=""
+  for _i in {1..60}; do
+    ip="$(tailscale_ip4)"
+    if [[ -n "$ip" ]] && tailscale_iface_has_ipv4; then
+      break
+    fi
     sleep 1
   done
 
-  if [[ -n "$ip" ]]; then
+  if [[ -n "$ip" ]] && tailscale_iface_has_ipv4; then
     ok "tailscale is up (ip ${ip})"
   else
-    warn "tailscale IP not detected (still not up/auth)."
+    # last remediation: restart daemon once, wait again
+    warn "tailscale IPv4 not detected yet -> restarting tailscaled and retrying"
+    tailscale_restart_daemon
+    tailscale_up_with_auth || true
+
+    for _i in {1..30}; do
+      ip="$(tailscale_ip4)"
+      if [[ -n "$ip" ]] && tailscale_iface_has_ipv4; then
+        break
+      fi
+      sleep 1
+    done
+
+    if [[ -n "$ip" ]] && tailscale_iface_has_ipv4; then
+      ok "tailscale is up (ip ${ip})"
+    else
+      warn "tailscale still has no IPv4 on tailscale0."
+      warn "This is unsafe to proceed with UFW (can lock you out). We'll skip enabling UFW."
+      TAILSCALE_READY="0"
+      return 0
+    fi
   fi
 
   local name
   name="$(tailscale_magicdns_name)"
   [[ -n "$name" ]] && ok "MagicDNS: ${name}" || warn "MagicDNS name not available (maybe disabled)."
+
+  TAILSCALE_READY="1"
 }
 
 ###############################################################################
@@ -952,19 +1004,12 @@ ssh_harden_apply() {
 }
 
 ###############################################################################
-# UFW firewall (lockout-safe)
+# UFW firewall
+# CRITICAL: if tailscale requested but not ready (no IPv4), DO NOT enable UFW
+# (prevents lock-out)
 ###############################################################################
-TAILSCALE_READY_FOR_FIREWALL="0"
-
 ufw_apply() {
   hdr "🧱 Firewall (UFW)"
-
-  # If tailscale requested but not up/authenticated -> skip UFW to avoid lockout
-  if [[ "${ARG_TAILSCALE}" == "1" && "${TAILSCALE_READY_FOR_FIREWALL}" != "1" ]]; then
-    warn "tailscale=1 but not ready (no tailscale IP). Skipping UFW to avoid SSH lockout."
-    warn "After you finish tailscale auth, you can run: sudo ufw status && re-run apply (or run ufw manually)."
-    return 0
-  fi
 
   if ! command -v ufw >/dev/null 2>&1; then
     aptq "Install UFW" install ufw
@@ -977,6 +1022,14 @@ ufw_apply() {
       sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw || true
     else
       echo 'DEFAULT_FORWARD_POLICY="ACCEPT"' >> /etc/default/ufw
+    fi
+  fi
+
+  # If tailscale is enabled, require it to be READY before enabling ufw
+  if [[ "${ARG_TAILSCALE}" == "1" ]]; then
+    if [[ "${TAILSCALE_READY:-0}" != "1" ]]; then
+      warn "tailscale enabled but not ready -> skipping UFW enable to avoid lockout."
+      return 0
     fi
   fi
 
@@ -997,6 +1050,7 @@ ufw_apply() {
     warn "WAN (${internet_iface}): no inbound ports opened (open-wan-443=0)"
   fi
 
+  # Tailscale: allow all (mandatory when enabled)
   if ip link show tailscale0 >/dev/null 2>&1; then
     ufw allow in on tailscale0 >/dev/null 2>&1 || true
     ufw allow out on tailscale0 >/dev/null 2>&1 || true
@@ -1005,6 +1059,7 @@ ufw_apply() {
     warn "tailscale0 not found (tailscale disabled or not up yet)."
   fi
 
+  # Docker bridges
   local docker_ifaces=""
   docker_ifaces="$(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^(docker0|br-)/ {print $2}' || true)"
   if [[ -n "$docker_ifaces" ]]; then
@@ -1043,37 +1098,23 @@ EOF
 }
 
 ###############################################################################
-# remnanode (compose create only if missing) - FIXED
+# remnanode (compose create only if missing)
+# - if remnanode=1: always ask interactively for NODE_PORT/SECRET_KEY when compose missing,
+#   even when piped, via /dev/tty.
 ###############################################################################
-SKIP_REMNANODE_INPUTS="0"
-
 remnanode_collect_inputs_early() {
   local compose="/opt/remnanode/docker-compose.yml"
-
-  # If compose exists -> skip
   if [[ -f "$compose" ]]; then
     ok "remnanode compose exists: ${compose} (skip inputs)"
     SKIP_REMNANODE_INPUTS="1"
     return 0
   fi
 
-  # If env already has both -> accept without asking
-  if [[ -n "${NODE_PORT:-}" && -n "${SECRET_KEY:-}" ]]; then
-    ok "remnanode inputs provided via env (NODE_PORT/SECRET_KEY)"
-    SKIP_REMNANODE_INPUTS="0"
-    return 0
-  fi
-
-  # Need inputs but no TTY -> DO NOT FAIL, just skip remnanode compose
-  if [[ ! -t 0 ]]; then
-    warn "remnanode=1 but compose missing and no TTY to ask for NODE_PORT/SECRET_KEY -> skipping remnanode compose creation."
-    warn "To enable remnanode in non-interactive mode, pass env vars:"
-    warn "  NODE_PORT=2222 SECRET_KEY='...' curl ... | sudo -E bash -s -- apply --remnanode=1"
-    SKIP_REMNANODE_INPUTS="1"
-    return 0
-  fi
-
   hdr "🧩 remnanode inputs (early)"
+
+  if ! _has_dev_tty; then
+    die "remnanode=1 but compose is missing and there is no /dev/tty to ask for NODE_PORT/SECRET_KEY."
+  fi
 
   local port="${NODE_PORT:-}"
   read_tty port "NODE_PORT for remnanode (default 2222): "
@@ -1083,9 +1124,7 @@ remnanode_collect_inputs_early() {
   local key="${SECRET_KEY:-}"
   read_tty_silent key "Paste SECRET_KEY (input hidden): "
   if [[ -z "$key" ]]; then
-    warn "SECRET_KEY empty -> remnanode compose will not be created."
-    SKIP_REMNANODE_INPUTS="1"
-    return 0
+    die "SECRET_KEY empty. Refusing to continue with remnanode=1 without inputs."
   fi
   SECRET_KEY="$key"
 
@@ -1093,6 +1132,27 @@ remnanode_collect_inputs_early() {
   SKIP_REMNANODE_INPUTS="0"
 }
 
+remnanode_logrotate_apply() {
+  # Your requested snippet: /var/log/remnanode/*.log rotate by size
+  mkdir -p /etc/logrotate.d
+  backup_file /etc/logrotate.d/remnanode
+  cat > /etc/logrotate.d/remnanode <<'EOF'
+/var/log/remnanode/*.log {
+  size 50M
+  rotate 5
+  compress
+  missingok
+  notifempty
+  copytruncate
+}
+EOF
+
+  # Best-effort: force run once to validate config
+  if command -v logrotate >/dev/null 2>&1; then
+    logrotate -vf /etc/logrotate.d/remnanode >>"$ERR_LOG" 2>&1 || true
+  fi
+  ok "remnanode logrotate configured: /etc/logrotate.d/remnanode"
+}
 
 remnanode_apply() {
   hdr "🧩 remnanode"
@@ -1105,8 +1165,8 @@ remnanode_apply() {
   mkdir -p "$dir" >/dev/null 2>&1 || true
 
   if [[ ! -f "$compose" ]]; then
-    [[ "${SKIP_REMNANODE_INPUTS:-0}" == "1" ]] && die "BUG: remnanode compose missing but inputs were skipped."
-    [[ -n "${SECRET_KEY:-}" ]] || die "SECRET_KEY missing; cannot create remnanode compose."
+    [[ "${SKIP_REMNANODE_INPUTS:-0}" == "1" ]] && die "remnanode compose missing but inputs were skipped."
+    [[ -n "${SECRET_KEY:-}" ]] || die "SECRET_KEY missing for remnanode compose."
     [[ -n "${NODE_PORT:-}" ]] || NODE_PORT="2222"
 
     backup_file "$compose"
@@ -1132,11 +1192,15 @@ EOF
     ok "remnanode compose exists: ${compose}"
   fi
 
+  # Start
   if (cd "$dir" && docker compose up -d) >>"$ERR_LOG" 2>&1; then
     ok "remnanode started"
   else
     warn "remnanode start failed (see $ERR_LOG)"
   fi
+
+  # logrotate for /var/log/remnanode/*.log (requested)
+  remnanode_logrotate_apply
 }
 
 remnanode_status_line() {
@@ -1448,7 +1512,6 @@ Unattended-Upgrade::Automatic-Reboot "false";
 Unattended-Upgrade::Automatic-Reboot-Time "04:00";
 EOM
 
-  # ---- logrotate base ----
   backup_file /etc/logrotate.conf
   cat > /etc/logrotate.conf <<EOM
 daily
@@ -1495,21 +1558,6 @@ EOM
   endscript
 }
 EOM
-
-  # ---- logrotate remnanode (your requested snippet) ----
-  backup_file /etc/logrotate.d/remnanode
-  cat > /etc/logrotate.d/remnanode <<'EOM'
-/var/log/remnanode/*.log {
-  size 50M
-  rotate 5
-  compress
-  missingok
-  notifempty
-  copytruncate
-}
-EOM
-  # best-effort: force-run once (does not fail script)
-  logrotate -vf /etc/logrotate.d/remnanode >/dev/null 2>&1 || true
 
   mkdir -p /etc/tmpfiles.d
   backup_file /etc/tmpfiles.d/edge-tmp.conf
@@ -1600,61 +1648,40 @@ apply_cmd() {
   snapshot_before
 
   if [[ -z "${ARG_USER}" ]]; then
-    if [[ -t 0 ]]; then
-      read_tty ARG_USER "User to create/ensure (leave empty to skip): "
-    fi
+    read_tty ARG_USER "User to create/ensure (leave empty to skip): "
   fi
 
   if [[ -z "${ARG_DNS_SWITCHER}" ]]; then
-    if [[ -t 0 ]]; then
-      local a="n"
-      read_tty a "Run DNS switcher early? [y/N]: "
-      [[ "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_DNS_SWITCHER="1" || ARG_DNS_SWITCHER="0"
-    else
-      ARG_DNS_SWITCHER="0"
-    fi
+    local a="n"
+    read_tty a "Run DNS switcher early? [y/N]: "
+    [[ "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_DNS_SWITCHER="1" || ARG_DNS_SWITCHER="0"
   fi
 
   if [[ -z "${ARG_TAILSCALE}" ]]; then
-    if [[ -t 0 ]]; then
-      local a="y"
-      read_tty a "Enable Tailscale early? [Y/n]: "
-      [[ -z "$a" || "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_TAILSCALE="1" || ARG_TAILSCALE="0"
-    else
-      ARG_TAILSCALE="1"
-    fi
+    local a="y"
+    read_tty a "Enable Tailscale early? [Y/n]: "
+    [[ -z "$a" || "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_TAILSCALE="1" || ARG_TAILSCALE="0"
   fi
 
   if [[ -z "${ARG_REMNANODE}" ]]; then
-    if [[ -t 0 ]]; then
-      local a="n"
-      read_tty a "Install/start remnanode? [y/N]: "
-      [[ "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_REMNANODE="1" || ARG_REMNANODE="0"
-    else
-      ARG_REMNANODE="0"
-    fi
+    local a="n"
+    read_tty a "Install/start remnanode? [y/N]: "
+    [[ "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_REMNANODE="1" || ARG_REMNANODE="0"
   fi
 
   if [[ -z "${ARG_SSH_HARDEN}" ]]; then
-    if [[ -t 0 ]]; then
-      local a="n"
-      read_tty a "Apply SSH hardening? [y/N]: "
-      [[ "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_SSH_HARDEN="1" || ARG_SSH_HARDEN="0"
-    else
-      ARG_SSH_HARDEN="0"
-    fi
+    local a="n"
+    read_tty a "Apply SSH hardening? [y/N]: "
+    [[ "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_SSH_HARDEN="1" || ARG_SSH_HARDEN="0"
   fi
 
   if [[ -z "${ARG_OPEN_WAN_443}" ]]; then
-    if [[ -t 0 ]]; then
-      local a="y"
-      read_tty a "Open WAN only 443 via UFW? [Y/n]: "
-      [[ -z "$a" || "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_OPEN_WAN_443="1" || ARG_OPEN_WAN_443="0"
-    else
-      ARG_OPEN_WAN_443="1"
-    fi
+    local a="y"
+    read_tty a "Open WAN only 443 via UFW? [Y/n]: "
+    [[ -z "$a" || "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_OPEN_WAN_443="1" || ARG_OPEN_WAN_443="0"
   fi
 
+  # If remnanode requested -> collect inputs early only if compose missing (interactive via /dev/tty)
   if [[ "${ARG_REMNANODE}" == "1" ]]; then
     remnanode_collect_inputs_early
   fi
@@ -1671,13 +1698,13 @@ apply_cmd() {
     dns_apply
   fi
 
+  # Tailscale MUST be done before UFW to prevent lockout
+  TAILSCALE_READY="0"
   if [[ "${ARG_TAILSCALE}" == "1" ]]; then
     tailscale_apply
-    if tailscale_is_running_with_ip; then
-      TAILSCALE_READY_FOR_FIREWALL="1"
-    else
-      TAILSCALE_READY_FOR_FIREWALL="0"
-      warn "Tailscale is not up yet -> firewall will be skipped to avoid lockout."
+    # If tailscale got IPv4 on tailscale0 -> ready, else we already warned and will skip UFW
+    if [[ "${TAILSCALE_READY:-0}" != "1" ]]; then
+      warn "tailscale not ready (no IPv4) -> UFW will be skipped."
     fi
   fi
 
@@ -1705,6 +1732,7 @@ apply_cmd() {
     ssh_harden_apply
   fi
 
+  # Firewall (safe: if tailscale enabled but not ready, ufw_apply will skip)
   ufw_apply
 
   iperf3_server_apply
