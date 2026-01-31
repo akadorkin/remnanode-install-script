@@ -26,14 +26,15 @@ while [[ $# -gt 0 ]]; do
     --reboot=*) REBOOT_DELAY="${1#*=}"; shift ;;
     --remnanode=*) REMNANODE="${1#*=}"; shift ;;
     --dns-switch=*) DNS_SWITCH="${1#*=}"; shift ;;
-    --nettest=*) shift ;;                 # deprecated: accepted for backward compatibility, ignored
 
     --user) USER_NAME="${2:-}"; shift 2 ;;
     --timezone) TIMEZONE="${2:-}"; shift 2 ;;
     --reboot) REBOOT_DELAY="${2:-}"; shift 2 ;;
     --remnanode) REMNANODE="${2:-0}"; shift 2 ;;
     --dns-switch) DNS_SWITCH="${2:-0}"; shift 2 ;;
-    --nettest) shift 2 ;;                 # deprecated: accepted for backward compatibility, ignored
+
+    --nettest=*|--nettest) # deprecated: accepted for backward compatibility, ignored
+      shift ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
   esac
 done
@@ -62,6 +63,23 @@ read_tty_silent(){
   read -rsp "$__prompt" __v </dev/tty || true
   echo >/dev/tty || true
   printf -v "$__var" '%s' "$__v"
+}
+
+# ---------------------- DOWNLOAD HELPERS (keep files in /root) ----------------------
+download_to_root() {
+  local url="$1"
+  local name="$2"
+  local out="/root/${name}"
+
+  runq "download ${name}" curl -fsSL "$url" -o "$out"
+  chmod +x "$out" || true
+  echo "$out"
+}
+
+run_local() {
+  # run_local "msg" "command..."
+  local msg="$1"; shift
+  runq "$msg" bash -lc "$* < /dev/null"
 }
 
 # ---------------------- SSHD HELPERS ----------------------
@@ -166,11 +184,15 @@ EOF_SYS
   ok "FD лимиты применены"
 }
 
-# ---------------------- PERF PROFILE (external script) ----------------------
+# ---------------------- PERF PROFILE (download to /root and run locally) ----------------------
 apply_perf_profile() {
   log "Perf-профиль сети (vps-network-tuning-script: initial.sh apply)"
-  runq "vps-network-tuning-script apply" bash -lc \
-    'curl -fsSL https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/main/initial.sh | sudo bash -s -- apply' || true
+  local PERF_SH
+  PERF_SH="$(download_to_root \
+    "https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/main/initial.sh" \
+    "vps-network-tuning-initial.sh")"
+
+  run_local "vps-network-tuning apply" "sudo bash '${PERF_SH}' apply" || true
   ok "Perf-профиль применён"
 }
 
@@ -438,6 +460,7 @@ EOF_DC
 fi
 
 # ---------------------- TAILSCALE (ТИХО, через runq) ----------------------
+# (оставлено как в старом скрипте — без изменений)
 log "Готовлю систему для Tailscale (IP forwarding + UDP GRO)"
 install -m 0644 /dev/stdin /etc/sysctl.d/99-tailscale-forwarding.conf <<'EOF_SYSCTL'
 net.ipv4.ip_forward=1
@@ -464,14 +487,10 @@ read_tty SSH_HARDEN "Применить SSH hardening сейчас? [y/N]: "
 case "${SSH_HARDEN,,}" in
   y|yes)
     if [[ -f "$SSHD_CONFIG" ]]; then
-      # Гарантируем наличие нужных директив (и перезаписываем, если уже есть)
       sed -i 's/^[[:space:]]*#\?[[:space:]]*PasswordAuthentication[[:space:]].*/PasswordAuthentication no/' "$SSHD_CONFIG" || true
       sed -i 's/^[[:space:]]*#\?[[:space:]]*PermitRootLogin[[:space:]].*/PermitRootLogin no/' "$SSHD_CONFIG" || true
-
-      # Если директив не было вообще — добавим в конец
       grep -qi '^[[:space:]]*PasswordAuthentication[[:space:]]' "$SSHD_CONFIG" || echo 'PasswordAuthentication no' >> "$SSHD_CONFIG"
       grep -qi '^[[:space:]]*PermitRootLogin[[:space:]]' "$SSHD_CONFIG" || echo 'PermitRootLogin no' >> "$SSHD_CONFIG"
-
       runq "restart sshd" bash -lc 'systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true'
       ok "SSH hardening применён"
     else
@@ -595,16 +614,18 @@ EOF
 
 # ---------------------- NODE EXPORTER (важно: после UFW) ----------------------
 log "Установка node-exporter (важно: после UFW)"
-runq "node_exporter install" bash -lc \
-  'bash <(curl -fsSL raw.githubusercontent.com/hteppl/sh/master/node_install.sh)' || true
+NODE_SH="$(download_to_root \
+  "https://raw.githubusercontent.com/hteppl/sh/master/node_install.sh" \
+  "node_install.sh")"
+run_local "node_exporter install" "bash '${NODE_SH}'" || true
 
 # ---------------------- DNS SWITCHER (опционально, после node-exporter) ----------------------
 if [[ "${DNS_SWITCH}" == "1" ]]; then
   log "dns-switch=1 → запускаю dns-switcher"
-  runq "download dns-switcher" bash -lc \
-    'wget "https://raw.githubusercontent.com/AndreyTimoschuk/dns-switcher/main/dns-switcher.sh" -O dns-switcher.sh' || true
-  runq "chmod dns-switcher" chmod +x dns-switcher.sh || true
-  runq "run dns-switcher" bash -lc 'sudo bash dns-switcher.sh' || true
+  DNS_SH="$(download_to_root \
+    "https://raw.githubusercontent.com/AndreyTimoschuk/dns-switcher/main/dns-switcher.sh" \
+    "dns-switcher.sh")"
+  run_local "run dns-switcher" "sudo bash '${DNS_SH}'" || true
 else
   ok "dns-switch=0 — пропускаю dns-switcher"
 fi
