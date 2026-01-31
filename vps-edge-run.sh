@@ -2,32 +2,22 @@
 set -Eeuo pipefail
 
 ###############################################################################
-# vps-edge-run.sh (assets-based orchestrator)
+# vps-edge-run.sh
 #
-# Usage:
-#   curl -fsSL https://raw.githubusercontent.com/akadorkin/remnanode-install-script/main/vps-edge-run.sh | sudo bash -s -- apply [flags]
+# Runs your small assets in order + prints a compact final summary.
+# Intended launch:
+#   curl -fsSL https://raw.githubusercontent.com/akadorkin/remnanode-install-script/main/vps-edge-run.sh \
+#     | sudo bash -s -- apply --user akadorkin --tailscale=1 --reboot=0 \
+#       --dns-switcher=1 --dns-profile=1 --remnanode=1 --ssh-harden=1 --open-wan-443=1
 #
-# Flags (apply):
-#   --user <name>            or --user=<name>
-#   --timezone <TZ>          or --timezone=<TZ>   (default: Europe/Moscow)
-#   --reboot 0|skip|none     or --reboot=<...>    (default: 0 = no reboot)
-#
-#   --dns-switcher 0|1       (default: 0)
-#   --dns-profile 1..5       (default: 1)
-#
-#   --tailscale 0|1          (default: 0)
-#   --remnanode 0|1          (default: 0)
-#   --ssh-harden 0|1         (default: 0)
-#   --open-wan-443 0|1       (default: 0)
-#
-# Notes:
-# - All heavy logic lives in assets/*.sh scripts.
-# - Kernel tuning upstream may exit with code=1 even after successful apply.
-#   We treat success by log signature: "OK Applied. Backup:".
+# ABSOLUTELY NO WARRANTIES. USE AT YOUR OWN RISK.
 ###############################################################################
 
-# -------------------- Colors / logging --------------------
+# -------------------------- Pretty logging --------------------------
+LOG_TS="${EDGE_LOG_TS:-1}"
+ts() { [[ "$LOG_TS" == "1" ]] && date +"%Y-%m-%d %H:%M:%S" || true; }
 _is_tty() { [[ -t 1 ]]; }
+
 c_reset=$'\033[0m'
 c_dim=$'\033[2m'
 c_bold=$'\033[1m'
@@ -36,145 +26,39 @@ c_yel=$'\033[33m'
 c_grn=$'\033[32m'
 c_cyan=$'\033[36m'
 
-ts() { date +"%Y-%m-%d %H:%M:%S"; }
-
-color() { local code="$1"; shift; _is_tty && printf "%s%s%s" "$code" "$*" "$c_reset" || printf "%s" "$*"; }
-_pfx() { _is_tty && printf "%s%s%s" "${c_dim}" "$(ts) " "${c_reset}" || printf "%s " "$(ts)"; }
+color() { local code="$1"; shift; if _is_tty; then printf "%s%s%s" "$code" "$*" "$c_reset"; else printf "%s" "$*"; fi; }
+_pfx() { _is_tty && printf "%s%s%s" "${c_dim}" "$(ts) " "${c_reset}" || true; }
 
 ok()   { _pfx; color "$c_grn" "✅ OK";    printf " %s\n" "$*"; }
 info() { _pfx; color "$c_cyan" "ℹ️ ";     printf " %s\n" "$*"; }
 warn() { _pfx; color "$c_yel" "⚠️  WARN"; printf " %s\n" "$*"; }
 err()  { _pfx; color "$c_red" "🛑 ERROR"; printf " %s\n" "$*"; }
-die()  { err "$*"; exit 1; }
 
 hdr() { echo; color "$c_bold$c_cyan" "$*"; echo; }
+die() { err "$*"; exit 1; }
 
+# -------------------------- Root / TTY helpers --------------------------
 need_root() {
-  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root (use sudo)."
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then return 0; fi
+  die "Not root. Use: curl ... | sudo bash -s -- apply ..."
+}
+read_tty() {
+  local __var="$1" __prompt="$2" __v=""
+  [[ -t 0 ]] || { printf -v "$__var" '%s' ""; return 0; }
+  read -rp "$__prompt" __v </dev/tty || true
+  printf -v "$__var" '%s' "$__v"
 }
 
-host_short() { hostname -s 2>/dev/null || hostname; }
-
-# -------------------- Default logs --------------------
-LOG_DIR="/var/log"
-LOG_APT="${LOG_DIR}/vps-edge-apt.log"
-LOG_DNS="${LOG_DIR}/vps-edge-dns-switcher.log"
-LOG_TS="${LOG_DIR}/vps-edge-tailscale.log"
-LOG_USER="${LOG_DIR}/vps-edge-user.log"
-LOG_ZSH="${LOG_DIR}/vps-edge-zsh.log"
-LOG_TUNE="${LOG_DIR}/vps-edge-tuning.log"
-LOG_UFW="${LOG_DIR}/vps-edge-ufw.log"
-LOG_REMNA="${LOG_DIR}/vps-edge-remnanode.log"
-LOG_SSH="${LOG_DIR}/vps-edge-ssh.log"
-LOG_SUMMARY="${LOG_DIR}/vps-edge-summary.log"
-LOG_ERR="${LOG_DIR}/vps-edge-error.log"
-
-mkdir -p "$LOG_DIR" >/dev/null 2>&1 || true
-touch "$LOG_APT" "$LOG_DNS" "$LOG_TS" "$LOG_USER" "$LOG_ZSH" "$LOG_TUNE" "$LOG_UFW" "$LOG_REMNA" "$LOG_SSH" "$LOG_SUMMARY" "$LOG_ERR" 2>/dev/null || true
-
-# -------------------- Asset URLs (your repo) --------------------
-URL_APT="${URL_APT:-https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/apt-bootstrap.sh}"
-URL_DNS="${URL_DNS:-https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/dns-bootstrap.sh}"
-URL_KERNEL="${URL_KERNEL:-https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/kernel-bootstrap.sh}"
-URL_PRINT_SUMMARY="${URL_PRINT_SUMMARY:-https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/print-summary.sh}"
-URL_REMNANODE="${URL_REMNANODE:-https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/remnanode-bootstrap.sh}"
-URL_SSH="${URL_SSH:-https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/ssh-bootstrap.sh}"
-URL_TS="${URL_TS:-https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/tailscale-bootstrap.sh}"
-URL_UFW="${URL_UFW:-https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/ufw-bootstrap.sh}"
-URL_USER="${URL_USER:-https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/user-setup.sh}"
-URL_ZSH="${URL_ZSH:-https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/zsh-bootstrap.sh}"
-
-# -------------------- Runtime helpers --------------------
-ext_ip() {
-  curl -fsSL --max-time 3 https://api.ipify.org 2>/dev/null \
-    || curl -fsSL --max-time 3 ifconfig.me 2>/dev/null \
-    || true
-}
-
-geo_lookup() {
-  # prints: CC|COUNTRY|REGION|CITY|ORG  (best-effort)
-  command -v jq >/dev/null 2>&1 || { echo "||||"; return 0; }
-  local ip="${1:-}"
-  local out=""
-  out="$(curl -fsSL --max-time 3 "https://ipinfo.io/${ip}/json" 2>/dev/null || true)"
-  if [[ -n "$out" ]]; then
-    local cc region city org
-    cc="$(printf "%s" "$out" | jq -r '.country // empty' 2>/dev/null || true)"
-    region="$(printf "%s" "$out" | jq -r '.region // empty' 2>/dev/null || true)"
-    city="$(printf "%s" "$out" | jq -r '.city // empty' 2>/dev/null || true)"
-    org="$(printf "%s" "$out" | jq -r '.org // empty' 2>/dev/null || true)"
-    printf "%s|%s|%s|%s|%s" "${cc:-}" "${cc:-}" "${region:-}" "${city:-}" "${org:-}"
-    return 0
-  fi
-  echo "||||"
-}
-
-country_flag() {
-  local cc="${1:-}"
-  cc="${cc^^}"
-  if [[ ! "$cc" =~ ^[A-Z]{2}$ ]]; then
-    printf "🏳️"
-    return 0
-  fi
-  awk -v cc="$cc" 'BEGIN{
-    o1 = ord(substr(cc,1,1))
-    o2 = ord(substr(cc,2,1))
-    cp1 = 0x1F1E6 + o1 - 65
-    cp2 = 0x1F1E6 + o2 - 65
-    printf "%c%c", cp1, cp2
-  }
-  function ord(c){ return index("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c)+64 }'
-}
-
-run_asset() {
-  # run_asset <name> <url> <logfile>
-  local name="$1" url="$2" logfile="$3"
-  local tmp="/tmp/${name}.sh"
-
-  info "Running asset: ${name}"
-  {
-    echo "----- $(ts) asset=${name} url=${url} -----"
-  } >>"$logfile" 2>/dev/null || true
-
-  if ! curl -fsSL "$url" -o "$tmp" >>"$logfile" 2>&1; then
-    warn "${name}: download failed (${url})"
-    return 2
-  fi
-  chmod +x "$tmp" >>"$logfile" 2>&1 || true
-
-  # Run asset (inherit env); keep stdout in terminal + in log
-  set +e
-  bash "$tmp" 2>&1 | tee -a "$logfile"
-  local rc=${PIPESTATUS[0]}
-  set -e
-
-  return "$rc"
-}
-
-tailscale_ip4() {
-  command -v tailscale >/dev/null 2>&1 || return 0
-  tailscale ip -4 2>/dev/null | head -n1 || true
-}
-tailscale_magicdns() {
-  command -v tailscale >/dev/null 2>&1 || return 0
-  if command -v jq >/dev/null 2>&1 && tailscale status --json >/dev/null 2>&1; then
-    tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' 2>/dev/null | sed 's/\.$//' || true
-  else
-    tailscale status 2>/dev/null | awk 'NR==1{print $2}' | sed 's/\.$//' || true
-  fi
-}
-
-# -------------------- Args / defaults --------------------
+# -------------------------- Args --------------------------
 CMD="${1:-}"; shift || true
 
 ARG_USER=""
 ARG_TIMEZONE="Europe/Moscow"
 ARG_REBOOT="0"
 
-ARG_DNS_SWITCHER="0"
-ARG_DNS_PROFILE="1"
-
 ARG_TAILSCALE="0"
+ARG_DNS_SWITCHER="0"
+ARG_DNS_PROFILE=""        # empty => interactive upstream
 ARG_REMNANODE="0"
 ARG_SSH_HARDEN="0"
 ARG_OPEN_WAN_443="0"
@@ -184,372 +68,461 @@ while [[ $# -gt 0 ]]; do
     --user=*)          ARG_USER="${1#*=}"; shift ;;
     --timezone=*)      ARG_TIMEZONE="${1#*=}"; shift ;;
     --reboot=*)        ARG_REBOOT="${1#*=}"; shift ;;
-
+    --tailscale=*)     ARG_TAILSCALE="${1#*=}"; shift ;;
     --dns-switcher=*)  ARG_DNS_SWITCHER="${1#*=}"; shift ;;
     --dns-profile=*)   ARG_DNS_PROFILE="${1#*=}"; shift ;;
-
-    --tailscale=*)     ARG_TAILSCALE="${1#*=}"; shift ;;
     --remnanode=*)     ARG_REMNANODE="${1#*=}"; shift ;;
     --ssh-harden=*)    ARG_SSH_HARDEN="${1#*=}"; shift ;;
     --open-wan-443=*)  ARG_OPEN_WAN_443="${1#*=}"; shift ;;
-
     --user)          ARG_USER="${2:-}"; shift 2 ;;
     --timezone)      ARG_TIMEZONE="${2:-}"; shift 2 ;;
     --reboot)        ARG_REBOOT="${2:-}"; shift 2 ;;
-
+    --tailscale)     ARG_TAILSCALE="${2:-}"; shift 2 ;;
     --dns-switcher)  ARG_DNS_SWITCHER="${2:-}"; shift 2 ;;
     --dns-profile)   ARG_DNS_PROFILE="${2:-}"; shift 2 ;;
-
-    --tailscale)     ARG_TAILSCALE="${2:-}"; shift 2 ;;
     --remnanode)     ARG_REMNANODE="${2:-}"; shift 2 ;;
     --ssh-harden)    ARG_SSH_HARDEN="${2:-}"; shift 2 ;;
     --open-wan-443)  ARG_OPEN_WAN_443="${2:-}"; shift 2 ;;
-    *)
-      die "Unknown arg: $1"
-      ;;
+    *) die "Unknown arg: $1" ;;
   esac
 done
 
-usage() {
-  cat <<'EOF'
-Usage:
-  apply:
-    curl -fsSL https://raw.githubusercontent.com/akadorkin/remnanode-install-script/main/vps-edge-run.sh | sudo bash -s -- apply [flags]
+# -------------------------- URLs (assets) --------------------------
+ASSET_APT="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/apt-bootstrap.sh"
+ASSET_DNS="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/dns-bootstrap.sh"
+ASSET_KERNEL="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/kernel-bootstrap.sh"
+ASSET_TAILSCALE="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/tailscale-bootstrap.sh"
+ASSET_USER="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/user-setup.sh"
+ASSET_ZSH="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/zsh-bootstrap.sh"
+ASSET_UFW="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/ufw-bootstrap.sh"
+ASSET_SSH="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/ssh-bootstrap.sh"
+ASSET_REMNANODE="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/remnanode-bootstrap.sh"
 
-  status:
-    curl -fsSL https://raw.githubusercontent.com/akadorkin/remnanode-install-script/main/vps-edge-run.sh | sudo bash -s -- status
+# -------------------------- Logs --------------------------
+LOG_DIR="/var/log"
+L_APT="${LOG_DIR}/vps-edge-apt.log"
+L_DNS="${LOG_DIR}/vps-edge-dns-switcher.log"
+L_TS="${LOG_DIR}/vps-edge-tailscale.log"
+L_USER="${LOG_DIR}/vps-edge-user.log"
+L_ZSH="${LOG_DIR}/vps-edge-zsh.log"
+L_UFW="${LOG_DIR}/vps-edge-ufw.log"
+L_SSH="${LOG_DIR}/vps-edge-ssh.log"
+L_REMNA="${LOG_DIR}/vps-edge-remnanode.log"
+L_KERNEL="${LOG_DIR}/vps-edge-tuning.log"
+touch "$L_APT" "$L_DNS" "$L_TS" "$L_USER" "$L_ZSH" "$L_UFW" "$L_SSH" "$L_REMNA" "$L_KERNEL" 2>/dev/null || true
 
-Flags:
-  --user <name>
-  --timezone <TZ>                (default: Europe/Moscow)
-  --reboot 0|skip|none|30s|5m     (default: 0)
+ASSETS_TMP="/tmp/vps-edge-assets"
+mkdir -p "$ASSETS_TMP"
 
-  --dns-switcher 0|1             (default: 0)
-  --dns-profile 1..5             (default: 1)
+# statuses for summary
+S_APT=0 S_DNS=0 S_TS=0 S_USER=0 S_ZSH=0 S_UFW=0 S_SSH=0 S_REMNA=0 S_KERNEL=0
+USER_CREATED="0"
+USER_PASS=""
 
-  --tailscale 0|1                (default: 0)
-  --remnanode 0|1                (default: 0)
-  --ssh-harden 0|1               (default: 0)
-  --open-wan-443 0|1             (default: 0)
-EOF
+# -------------------------- Small utils for summary --------------------------
+host_short() { hostname -s 2>/dev/null || hostname; }
+
+ext_ip() {
+  curl -fsSL --max-time 3 https://api.ipify.org 2>/dev/null \
+    || curl -fsSL --max-time 3 ifconfig.me 2>/dev/null \
+    || true
 }
 
-# -------------------- Summary runner (always best-effort) --------------------
-SUMMARY_RAN="0"
-run_summary_best_effort() {
-  [[ "$SUMMARY_RAN" == "1" ]] && return 0
-  SUMMARY_RAN="1"
+tailscale_ip4() { command -v tailscale >/dev/null 2>&1 && tailscale ip -4 2>/dev/null | head -n1 || true; }
+tailscale_dnsname() {
+  command -v tailscale >/dev/null 2>&1 || return 0
+  if command -v jq >/dev/null 2>&1 && tailscale status --json >/dev/null 2>&1; then
+    tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' 2>/dev/null | sed 's/\.$//' || true
+    return 0
+  fi
+  tailscale status 2>/dev/null | awk 'NR==1{print $2}' | sed 's/\.$//' || true
+}
 
-  # Export logs + key facts for summary asset
-  export EDGE_LOG_APT="$LOG_APT"
-  export EDGE_LOG_DNS="$LOG_DNS"
-  export EDGE_LOG_TS="$LOG_TS"
-  export EDGE_LOG_USER="$LOG_USER"
-  export EDGE_LOG_ZSH="$LOG_ZSH"
-  export EDGE_LOG_TUNE="$LOG_TUNE"
-  export EDGE_LOG_UFW="$LOG_UFW"
-  export EDGE_LOG_REMNANODE="$LOG_REMNA"
-  export EDGE_LOG_SSH="$LOG_SSH"
-  export EDGE_LOG_SUMMARY="$LOG_SUMMARY"
-  export EDGE_LOG_ERR="$LOG_ERR"
+ram_gib_rounded() {
+  local kb
+  kb="$(awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+  awk -v kb="$kb" 'BEGIN{
+    gib = kb/1024/1024;
+    if (gib < 0.5) { printf "0"; exit }
+    printf "%.0f", gib+0.5
+  }'
+}
+cpu_cores() { nproc 2>/dev/null || echo 1; }
+root_size_gib() {
+  local b
+  b="$(df -B1 / 2>/dev/null | awk 'NR==2{print $2}' || echo 0)"
+  awk -v b="$b" 'BEGIN{ printf "%.0f", b/1024/1024/1024 }'
+}
+swap_mib() {
+  local b
+  b="$(/sbin/swapon --bytes --noheadings 2>/dev/null | awk '{s+=$3} END{print s+0}' || echo 0)"
+  awk -v b="$b" 'BEGIN{ printf "%.0f", b/1024/1024 }'
+}
 
-  export EDGE_USER="${ARG_USER}"
-  export EDGE_TIMEZONE="${ARG_TIMEZONE}"
-  export EDGE_DNS_SWITCHER="${ARG_DNS_SWITCHER}"
-  export EDGE_DNS_PROFILE="${ARG_DNS_PROFILE}"
-  export EDGE_TAILSCALE="${ARG_TAILSCALE}"
-  export EDGE_REMNANODE="${ARG_REMNANODE}"
-  export EDGE_SSH_HARDEN="${ARG_SSH_HARDEN}"
-  export EDGE_OPEN_WAN_443="${ARG_OPEN_WAN_443}"
+dns_profile_from_resolved() {
+  # best-effort: recognize profile by DNS line
+  local dns
+  dns="$(awk -F= 'tolower($1)=="dns"{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}' /etc/systemd/resolved.conf 2>/dev/null | head -n1 || true)"
+  [[ -n "$dns" ]] || { echo "-"; return 0; }
+  case "$dns" in
+    *"8.8.8.8"*1.1.1.1* ) echo "1) Google + Cloudflare" ;;
+    *"8.8.8.8"*8.8.4.4* ) echo "2) Google only" ;;
+    *"1.1.1.1"*1.0.0.1* ) echo "3) Cloudflare only" ;;
+    *"9.9.9.9"*149.112.112.112* ) echo "4) Quad9" ;;
+    * ) echo "custom (${dns})" ;;
+  esac
+}
 
-  export EDGE_WAN_IP="${WAN_IP:-}"
-  export EDGE_GEO_CC="${GEO_CC:-}"
-  export EDGE_GEO_CITY="${GEO_CITY:-}"
-  export EDGE_GEO_REGION="${GEO_REGION:-}"
-  export EDGE_GEO_PROVIDER="${GEO_PROVIDER:-}"
-  export EDGE_GEO_FLAG="${GEO_FLAG:-}"
+conntrack_max() { cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo "-"; }
+nofile_limit() {
+  # show systemd DefaultLimitNOFILE if present, otherwise current ulimit
+  local v
+  v="$(systemctl show --property DefaultLimitNOFILE 2>/dev/null | cut -d= -f2 || true)"
+  [[ -n "$v" ]] && { echo "$v"; return 0; }
+  ulimit -n 2>/dev/null || echo "-"
+}
 
-  # Kernel backup dir (if detected)
-  export EDGE_KERNEL_BACKUP_DIR="${KERNEL_BACKUP_DIR:-}"
+# parse kernel tuning asset log (it embeds upstream output)
+kernel_profile_from_log() {
+  # looks like: "Profile      | mid"
+  grep -E '^[[:space:]]*Profile[[:space:]]+\|' "$L_KERNEL" 2>/dev/null | tail -n1 | awk -F'|' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}' || true
+}
+kernel_planned_from_log() {
+  # prints a few “Planned” lines if present
+  awk '
+    $0 ~ /^Planned \(computed targets\)/ {in=1; next}
+    in && $0 ~ /^[A-Za-z]/ && $0 ~ /\|/ { print $0 }
+    in && $0 ~ /^$/ { exit }
+  ' "$L_KERNEL" 2>/dev/null || true
+}
+kernel_backup_from_log() {
+  grep -Eo '/root/edge-tuning-backup-[0-9]{8}-[0-9]{6}' "$L_KERNEL" 2>/dev/null | tail -n1 || true
+}
 
-  # Tailscale facts
-  export EDGE_TS_IP="$(tailscale_ip4 || true)"
-  export EDGE_TS_NAME="$(tailscale_magicdns || true)"
+remnanode_status() {
+  command -v docker >/dev/null 2>&1 || { echo "-"; return 0; }
+  docker ps --filter "name=remnanode" --format '{{.Status}}' 2>/dev/null | head -n1 || true
+}
+remnanode_uptime_compact() {
+  local st
+  st="$(remnanode_status)"
+  [[ -n "$st" ]] || { echo "-"; return 0; }
+  # Status is like "Up 3 minutes" / "Up 2 hours"
+  echo "$st"
+}
+remnanode_log_health() {
+  # very best-effort: if we see "error" in last 200 lines of /var/log/remnanode/*.log
+  [[ -d /var/log/remnanode ]] || { echo "-"; return 0; }
+  local last
+  last="$(tail -n 200 /var/log/remnanode/*.log 2>/dev/null | tr '[:upper:]' '[:lower:]' | grep -E 'error|panic|fatal' | tail -n 1 || true)"
+  [[ -n "$last" ]] && echo "⚠️ found errors (check /var/log/remnanode/*.log)" || echo "✅ no obvious errors (last 200 lines)"
+}
 
-  # Run summary asset
-  hdr "🧾 Summary"
+remnanode_logrotate_policy() {
+  if [[ -f /etc/logrotate.d/remnanode ]]; then
+    awk 'NF{print}' /etc/logrotate.d/remnanode 2>/dev/null | sed 's/^/  /'
+  else
+    echo "  - (not configured)"
+  fi
+}
+
+# -------------------------- Asset runner --------------------------
+run_asset() {
+  local name="$1" url="$2" log_file="$3"
+  local tmp="${ASSETS_TMP}/${name}.sh"
+
+  info "Running asset: ${name}"
+  : >"$log_file" || true
+
+  if ! curl -fsSL "$url" -o "$tmp" >>"$log_file" 2>&1; then
+    warn "${name} download failed: ${url}"
+    return 2
+  fi
+  chmod +x "$tmp" >>"$log_file" 2>&1 || true
+
+  # Run asset (allow interactive via /dev/tty)
   set +e
-  run_asset "print-summary" "$URL_PRINT_SUMMARY" "$LOG_SUMMARY"
+  bash "$tmp" >>"$log_file" 2>&1
   local rc=$?
   set -e
+
   if [[ $rc -eq 0 ]]; then
-    ok "summary printed"
+    ok "${name} finished"
   else
-    warn "summary asset exited with code=$rc (see $LOG_SUMMARY)"
+    warn "${name} exited with code=${rc} (see ${log_file})"
+  fi
+  return "$rc"
+}
+
+# -------------------------- Hostname (interactive, early) --------------------------
+hostname_apply_interactive() {
+  [[ -t 0 ]] || return 0
+
+  local current new
+  current="$(hostnamectl --static 2>/dev/null || hostname)"
+
+  hdr "🖥️  Hostname"
+  echo "Current hostname : ${current}"
+  read_tty new "Enter new hostname (leave empty to keep current): "
+
+  if [[ -n "${new:-}" && "$new" != "$current" ]]; then
+    hostnamectl set-hostname "$new"
+    ok "Hostname changed to: $new"
+  else
+    info "Hostname unchanged"
   fi
 }
 
-on_exit_apply() {
-  # Always try to print summary at the end of apply (even on early failure)
-  local code=$?
-  if [[ "${CMD}" == "apply" ]]; then
-    run_summary_best_effort || true
-  fi
-  exit "$code"
-}
-
-# -------------------- Apply flow --------------------
-print_start_banner() {
-  hdr "🏁 Start"
-  local ip gl cc region city org flag
-  ip="$(ext_ip)"
-  [[ -n "$ip" ]] || ip="?"
-  gl="$(geo_lookup "$ip")"
-  cc="${gl%%|*}"
-  region="$(echo "$gl" | cut -d'|' -f3)"
-  city="$(echo "$gl" | cut -d'|' -f4)"
-  org="$(echo "$gl" | cut -d'|' -f5)"
-  flag="$(country_flag "$cc")"
-
-  echo "  ${flag} ${ip} — ${city:-?}, ${region:-?}, ${cc:-?} — ${org:-?}"
-
-  WAN_IP="$ip"
-  GEO_CC="$cc"
-  GEO_CITY="$city"
-  GEO_REGION="$region"
-  GEO_PROVIDER="$org"
-  GEO_FLAG="$flag"
-}
-
+# -------------------------- Timezone --------------------------
 timezone_apply() {
   hdr "🕒 Timezone"
   if [[ -n "${ARG_TIMEZONE:-}" ]]; then
-    ln -sf "/usr/share/zoneinfo/${ARG_TIMEZONE}" /etc/localtime >>"$LOG_ERR" 2>&1 || true
-    timedatectl set-timezone "${ARG_TIMEZONE}" >>"$LOG_ERR" 2>&1 || true
+    ln -sf "/usr/share/zoneinfo/${ARG_TIMEZONE}" /etc/localtime 2>/dev/null || true
+    timedatectl set-timezone "${ARG_TIMEZONE}" >/dev/null 2>&1 || true
     ok "Timezone set to ${ARG_TIMEZONE}"
   fi
 }
 
+# -------------------------- Reboot scheduling --------------------------
 maybe_reboot() {
   local r="${ARG_REBOOT:-0}"
-  case "${r}" in
-    0|no|none|skip|"")
-      warn "Reboot disabled (--reboot=${r})"
-      ;;
-    30s|30sec|30)
-      warn "Reboot in 30 seconds"
-      shutdown -r +0.5 >/dev/null 2>&1 || shutdown -r now
-      ;;
-    5m|5min|300)
-      warn "Reboot in 5 minutes"
-      shutdown -r +5 >/dev/null 2>&1 || shutdown -r now
-      ;;
-    *)
-      warn "Reboot in ${r}"
-      shutdown -r +"${r}" >/dev/null 2>&1 || shutdown -r now
-      ;;
+  case "$r" in
+    0|no|none|skip|"") info "Reboot disabled (--reboot=${r})" ;;
+    30s|30sec|30) warn "Reboot in 30 seconds"; shutdown -r +0.5 >/dev/null 2>&1 || shutdown -r now ;;
+    5m|5min|300)  warn "Reboot in 5 minutes";  shutdown -r +5   >/dev/null 2>&1 || shutdown -r now ;;
+    *)            warn "Reboot in ${r}";        shutdown -r +"${r}" >/dev/null 2>&1 || shutdown -r now ;;
   esac
 }
 
-apply_cmd() {
-  need_root
-  trap on_exit_apply EXIT
+# -------------------------- Summary (final) --------------------------
+print_summary() {
+  hdr "🧾 Summary"
 
-  print_start_banner
+  local wan host ram cpu rootg swapm tsip tsname
+  host="$(host_short)"
+  wan="$(ext_ip)"; [[ -n "$wan" ]] || wan="?"
+  ram="$(ram_gib_rounded)"
+  cpu="$(cpu_cores)"
+  rootg="$(root_size_gib)"
+  swapm="$(swap_mib)"
+  tsip="$(tailscale_ip4)"
+  tsname="$(tailscale_dnsname)"
+
+  echo "🖥️  Host      : ${host}"
+  echo "🌍 WAN IP    : ${wan}"
+  echo "🧠 CPU/RAM   : ${cpu} cores / ~${ram} GiB"
+  echo "💾 Disk /    : ~${rootg} GiB"
+  echo "🧊 Swap      : ~${swapm} MiB"
+  echo
+
+  echo "🧠 Tailscale : ${tsip:-"-"}"
+  echo "🔗 MagicDNS  : ${tsname:-"-"}"
+  echo
+
+  echo "🌐 DNS       : $(dns_profile_from_resolved)"
+  echo "🔗 Repo DNS  : https://github.com/AndreyTimoschuk/dns-switcher"
+  echo
+
+  local kprof kbkp
+  kprof="$(kernel_profile_from_log)"; [[ -n "$kprof" ]] || kprof="-"
+  kbkp="$(kernel_backup_from_log)"; [[ -n "$kbkp" ]] || kbkp="-"
+
+  echo "🧩 Kernel tuning profile : ${kprof}"
+  echo "🧳 Kernel backup dir     : ${kbkp}"
+  echo "🔗 Repo tuning           : https://github.com/akadorkin/vps-network-tuning-script"
+  echo
+
+  echo "🧱 Limits"
+  echo "  🧷 Conntrack max : $(conntrack_max)"
+  echo "  📎 Nofile        : $(nofile_limit)"
+  echo
+
+  echo "🧾 Planned tuning (from log, if available)"
+  local planned
+  planned="$(kernel_planned_from_log || true)"
+  if [[ -n "$planned" ]]; then
+    echo "$planned" | sed 's/^/  /'
+  else
+    echo "  - (not detected in log)"
+  fi
+  echo
+
+  # User block
+  echo "👤 User"
+  if [[ -n "${ARG_USER:-}" ]]; then
+    echo "  🧑 Name     : ${ARG_USER}"
+    if [[ "${USER_CREATED:-0}" == "1" ]]; then
+      echo "  🔑 Password : ${USER_PASS}"
+      echo "  🛡️  Sudo     : NOPASSWD ✅"
+      echo "  🐳 Docker   : added to docker group ✅"
+      echo "  📁 /opt     : write access granted ✅"
+    else
+      echo "  🔑 Password : (unchanged)"
+    fi
+  else
+    echo "  - (skipped)"
+  fi
+  echo
+
+  # remnanode
+  echo "🧩 remnanode"
+  if command -v docker >/dev/null 2>&1; then
+    local st
+    st="$(remnanode_uptime_compact)"
+    if [[ -n "$st" ]]; then
+      echo "  🐳 Container : ${st}"
+      echo "  📄 Logs      : $(remnanode_log_health)"
+      echo "  📁 Compose   : /opt/remnanode/docker-compose.yml"
+      echo
+      echo "  🗂️  Logrotate policy (/etc/logrotate.d/remnanode):"
+      remnanode_logrotate_policy
+    else
+      echo "  - container not running (docker ps name=remnanode is empty)"
+    fi
+  else
+    echo "  - docker not installed"
+  fi
+  echo
+
+  # steps status
+  echo "✅ Steps"
+  echo "  📦 Packages     : $([[ $S_APT -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_APT)")"
+  echo "  🌐 DNS switcher : $([[ $S_DNS -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_DNS)")"
+  echo "  🧠 Tailscale    : $([[ $S_TS -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_TS)")"
+  echo "  👤 User setup   : $([[ $S_USER -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_USER)")"
+  echo "  💅 Zsh          : $([[ $S_ZSH -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_ZSH)")"
+  echo "  🧱 UFW          : $([[ $S_UFW -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_UFW)")"
+  echo "  🔐 SSH/Fail2ban : $([[ $S_SSH -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_SSH)")"
+  echo "  🧩 remnanode    : $([[ $S_REMNA -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_REMNA)")"
+  echo "  🧠 Kernel tune  : $([[ $S_KERNEL -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_KERNEL)")"
+  echo
+
+  echo "📄 Logs"
+  echo "  📦 $L_APT"
+  echo "  🌐 $L_DNS"
+  echo "  🧠 $L_TS"
+  echo "  👤 $L_USER"
+  echo "  💅 $L_ZSH"
+  echo "  🧱 $L_UFW"
+  echo "  🔐 $L_SSH"
+  echo "  🧩 $L_REMNA"
+  echo "  🧠 $L_KERNEL"
+}
+
+# -------------------------- Apply flow --------------------------
+apply_cmd() {
+  need_root "$@"
+
+  hostname_apply_interactive
   timezone_apply
 
-  # Export common env for assets
-  export EDGE_TIMEZONE="${ARG_TIMEZONE}"
-  export EDGE_USER="${ARG_USER}"
+  hdr "🏁 Start"
+  echo "  🌍 $(ext_ip || true)"
+  echo
 
-  export EDGE_DNS_PROFILE="${ARG_DNS_PROFILE}"
-  export EDGE_DNS_SWITCHER="${ARG_DNS_SWITCHER}"
-  export EDGE_TAILSCALE="${ARG_TAILSCALE}"
-  export EDGE_REMNANODE="${ARG_REMNANODE}"
-  export EDGE_SSH_HARDEN="${ARG_SSH_HARDEN}"
-  export EDGE_OPEN_WAN_443="${ARG_OPEN_WAN_443}"
-
-  # 1) apt bootstrap
+  # APT
   hdr "📦 Packages"
-  if run_asset "apt-bootstrap" "$URL_APT" "$LOG_APT"; then
-    ok "apt-bootstrap finished"
-  else
-    warn "apt-bootstrap exited with code=$? (see $LOG_APT)"
-    # Continue; some assets may still run, and summary will print
-  fi
+  if run_asset "apt-bootstrap" "$ASSET_APT" "$L_APT"; then S_APT=0; else S_APT=$?; fi
 
-  # 2) DNS (optional)
+  # DNS
   if [[ "${ARG_DNS_SWITCHER}" == "1" ]]; then
-    hdr "🌐 DNS switcher (early)"
-    set +e
-    run_asset "dns-bootstrap" "$URL_DNS" "$LOG_DNS"
-    local rc=$?
-    set -e
-    if [[ $rc -eq 0 ]]; then
-      ok "dns-bootstrap finished"
-      ok "dns-switcher applied (see ${LOG_DNS})"
-    else
-      warn "dns-bootstrap exited with code=$rc (see ${LOG_DNS})"
-      warn "dns-switcher may still be applied; check log."
-    fi
+    hdr "🌐 DNS switcher"
+    # Export vars for asset (so it can auto-feed y + profile)
+    export DNS_PROFILE="${ARG_DNS_PROFILE:-}"
+    if run_asset "dns-bootstrap" "$ASSET_DNS" "$L_DNS"; then S_DNS=0; else S_DNS=$?; fi
+    ok "dns-switcher applied (see $L_DNS)"
   fi
 
-  # 3) Tailscale (optional)
+  # Tailscale
   if [[ "${ARG_TAILSCALE}" == "1" ]]; then
-    hdr "🧠 Tailscale (early)"
-    set +e
-    run_asset "tailscale-bootstrap" "$URL_TS" "$LOG_TS"
-    local rc=$?
-    set -e
-    if [[ $rc -eq 0 ]]; then
-      ok "tailscale-bootstrap finished"
-    else
-      warn "tailscale-bootstrap exited with code=$rc (see ${LOG_TS})"
-    fi
-
-    local ip name
-    ip="$(tailscale_ip4 || true)"
-    name="$(tailscale_magicdns || true)"
-    [[ -n "$ip" ]] && ok "tailscale ip: $ip" || warn "tailscale ip not detected"
-    [[ -n "$name" ]] && ok "MagicDNS: $name" || warn "MagicDNS not detected"
+    hdr "🧠 Tailscale"
+    if run_asset "tailscale-bootstrap" "$ASSET_TAILSCALE" "$L_TS"; then S_TS=0; else S_TS=$?; fi
+    ok "tailscale ip: $(tailscale_ip4 || true)"
+    ok "MagicDNS: $(tailscale_dnsname || true)"
   fi
 
-  # 4) User setup (optional if user provided)
+  # User
   if [[ -n "${ARG_USER:-}" ]]; then
     hdr "👤 User setup"
-    set +e
-    run_asset "user-setup" "$URL_USER" "$LOG_USER"
-    local rc=$?
-    set -e
-    if [[ $rc -eq 0 ]]; then
-      ok "user-setup finished"
+    export USER_NAME="${ARG_USER}"
+    if run_asset "user-setup" "$ASSET_USER" "$L_USER"; then
+      S_USER=0
     else
-      warn "user-setup exited with code=$rc (see ${LOG_USER})"
-      ok "user-setup done (see ${LOG_USER})"
+      S_USER=$?
+      # user-setup might be idempotent and return non-0 for “exists”, but we still continue
     fi
+
+    # Extract "created" + password from user-setup log (expected lines):
+    #   USER_CREATED=1
+    #   USER_PASS=...
+    USER_CREATED="$(grep -E '^USER_CREATED=' "$L_USER" 2>/dev/null | tail -n1 | cut -d= -f2 | tr -d '\r' || echo 0)"
+    USER_PASS="$(grep -E '^USER_PASS=' "$L_USER" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d '\r' || true)"
+    [[ -z "${USER_CREATED:-}" ]] && USER_CREATED="0"
   fi
 
-  # 5) Zsh (always ok to run; it should be idempotent)
+  # Zsh
   hdr "💅 Zsh"
-  if run_asset "zsh-bootstrap" "$URL_ZSH" "$LOG_ZSH"; then
-    ok "zsh-bootstrap finished"
-  else
-    warn "zsh-bootstrap exited with code=$? (see ${LOG_ZSH})"
-  fi
+  if run_asset "zsh-bootstrap" "$ASSET_ZSH" "$L_ZSH"; then S_ZSH=0; else S_ZSH=$?; fi
 
-  # 6) Kernel tuning (treat success by log signature, NOT exit code)
+  # Kernel tuning (do not stop whole run on non-zero; upstream can return 1 with rollback hint)
   hdr "🧠 Kernel + system tuning"
-  set +e
-  run_asset "kernel-bootstrap" "$URL_KERNEL" "$LOG_TUNE"
-  local krc=$?
-  set -e
-
-  if grep -qE '^OK Applied\. Backup:' "$LOG_TUNE"; then
-    # Extract backup dir if present
-    KERNEL_BACKUP_DIR="$(grep -Eo '/root/edge-tuning-backup-[0-9]{8}-[0-9]{6,}' "$LOG_TUNE" | head -n1 || true)"
-    export EDGE_KERNEL_BACKUP_DIR="${KERNEL_BACKUP_DIR:-}"
-
-    ok "kernel tuning applied"
-    [[ -n "${KERNEL_BACKUP_DIR:-}" ]] && warn "Kernel tuning backup: ${KERNEL_BACKUP_DIR}"
-    warn "Kernel script returned rc=${krc}, but APPLY succeeded (this is expected sometimes)."
-    [[ -n "${KERNEL_BACKUP_DIR:-}" ]] && warn "Rollback (if ever needed): sudo BACKUP_DIR=${KERNEL_BACKUP_DIR} bash rollback"
-
-    echo
-    # Print the nice upstream report (trim if you want)
-    sed -n '1,260p' "$LOG_TUNE" || true
+  if run_asset "kernel-bootstrap" "$ASSET_KERNEL" "$L_KERNEL"; then
+    S_KERNEL=0
   else
-    warn "kernel-bootstrap exited with code=${krc} and no 'OK Applied' found (see ${LOG_TUNE})"
-    # Do NOT hard-exit here; continue, summary will include rollback hint from log.
+    S_KERNEL=$?
+    warn "kernel tuning returned rc=$S_KERNEL (see $L_KERNEL) — continuing"
   fi
 
-  # 7) UFW (optional)
+  # UFW
   if [[ "${ARG_OPEN_WAN_443}" == "1" || "${ARG_TAILSCALE}" == "1" ]]; then
     hdr "🧱 UFW"
-    set +e
-    run_asset "ufw-bootstrap" "$URL_UFW" "$LOG_UFW"
-    local rc=$?
-    set -e
-    if [[ $rc -eq 0 ]]; then
-      ok "ufw-bootstrap finished"
-    else
-      warn "ufw-bootstrap exited with code=$rc (see ${LOG_UFW})"
-    fi
+    export OPEN_WAN_443="${ARG_OPEN_WAN_443}"
+    export ENABLE_TAILSCALE="${ARG_TAILSCALE}"
+    if run_asset "ufw-bootstrap" "$ASSET_UFW" "$L_UFW"; then S_UFW=0; else S_UFW=$?; fi
   fi
 
-  # 8) remnanode (optional)
-  if [[ "${ARG_REMNANODE}" == "1" ]]; then
-    hdr "🧩 remnanode"
-    set +e
-    run_asset "remnanode-bootstrap" "$URL_REMNANODE" "$LOG_REMNA"
-    local rc=$?
-    set -e
-    if [[ $rc -eq 0 ]]; then
-      ok "remnanode-bootstrap finished"
-    else
-      warn "remnanode-bootstrap exited with code=$rc (see ${LOG_REMNA})"
-    fi
-  fi
-
-  # 9) SSH hardening (optional)
+  # SSH / fail2ban / recidive
   if [[ "${ARG_SSH_HARDEN}" == "1" ]]; then
     hdr "🔐 SSH hardening + fail2ban"
-    set +e
-    run_asset "ssh-bootstrap" "$URL_SSH" "$LOG_SSH"
-    local rc=$?
-    set -e
-    if [[ $rc -eq 0 ]]; then
-      ok "ssh-bootstrap finished"
-    else
-      warn "ssh-bootstrap exited with code=$rc (see ${LOG_SSH})"
-    fi
+    if run_asset "ssh-bootstrap" "$ASSET_SSH" "$L_SSH"; then S_SSH=0; else S_SSH=$?; fi
   fi
 
-  # Summary is printed by EXIT trap (always)
+  # remnanode
+  if [[ "${ARG_REMNANODE}" == "1" ]]; then
+    hdr "🧩 remnanode"
+    if run_asset "remnanode-bootstrap" "$ASSET_REMNANODE" "$L_REMNA"; then S_REMNA=0; else S_REMNA=$?; fi
+  fi
+
+  # Final summary
+  print_summary
+
+  # Reboot (optional)
   maybe_reboot
 }
 
-status_cmd() {
-  need_root
-  hdr "📊 Status"
-  echo "Host: $(host_short)"
-  echo "Timezone: $(timedatectl show -p Timezone --value 2>/dev/null || true)"
-  echo
-  echo "Tailscale:"
-  if command -v tailscale >/dev/null 2>&1; then
-    echo "  IP: $(tailscale_ip4 || true)"
-    echo "  DNS: $(tailscale_magicdns || true)"
-  else
-    echo "  (not installed)"
-  fi
-  echo
-  echo "UFW:"
-  if command -v ufw >/dev/null 2>&1; then
-    ufw status 2>/dev/null || true
-  else
-    echo "  (not installed)"
-  fi
-  echo
-  echo "Logs:"
-  echo "  - APT:      $LOG_APT"
-  echo "  - DNS:      $LOG_DNS"
-  echo "  - TS:       $LOG_TS"
-  echo "  - USER:     $LOG_USER"
-  echo "  - ZSH:      $LOG_ZSH"
-  echo "  - TUNE:     $LOG_TUNE"
-  echo "  - UFW:      $LOG_UFW"
-  echo "  - REMNA:    $LOG_REMNA"
-  echo "  - SSH:      $LOG_SSH"
-  echo "  - SUMMARY:  $LOG_SUMMARY"
-  echo "  - ERROR:    $LOG_ERR"
+usage() {
+  cat <<'EOF'
+Usage:
+  sudo ./vps-edge-run.sh apply [flags]
+
+Flags:
+  --user <name>                Create/ensure user (asset user-setup), copy ssh keys, sudo NOPASSWD, docker group, /opt writable
+  --timezone <TZ>              Default: Europe/Moscow
+  --reboot <0|skip|5m|30s|...> Default: 0 (no reboot)
+
+  --dns-switcher 0|1           Run DNS switcher asset
+  --dns-profile 1..5           If passed and dns-switcher=1 => auto-apply this profile; else interactive upstream
+
+  --tailscale 0|1              Run tailscale setup asset
+  --remnanode 0|1              Run remnanode asset (compose + start + logrotate)
+  --ssh-harden 0|1             Run ssh+fail2ban asset
+  --open-wan-443 0|1           Run ufw asset (WAN allow 443 tcp/udp; outgoing allow all; tailscale allow all)
+EOF
 }
 
-# -------------------- Main --------------------
-case "${CMD}" in
-  apply)    apply_cmd ;;
-  status)   status_cmd ;;
+# -------------------------- Main --------------------------
+case "$CMD" in
+  apply) apply_cmd ;;
   ""|help|-h|--help) usage; exit 0 ;;
-  *)
-    usage
-    exit 1
-    ;;
+  *) usage; exit 1 ;;
 esac
