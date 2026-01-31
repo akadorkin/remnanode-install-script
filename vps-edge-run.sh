@@ -4,12 +4,6 @@ set -Eeuo pipefail
 ###############################################################################
 # vps-edge-run.sh
 #
-# Runs your small assets in order + prints a compact final summary.
-# Intended launch:
-#   curl -fsSL https://raw.githubusercontent.com/akadorkin/remnanode-install-script/main/vps-edge-run.sh \
-#     | sudo bash -s -- apply --user akadorkin --tailscale=1 --reboot=0 \
-#       --dns-switcher=1 --dns-profile=1 --remnanode=1 --ssh-harden=1 --open-wan-443=1
-#
 # ABSOLUTELY NO WARRANTIES. USE AT YOUR OWN RISK.
 ###############################################################################
 
@@ -160,7 +154,6 @@ swap_mib() {
 }
 
 dns_profile_from_resolved() {
-  # best-effort: recognize profile by DNS line
   local dns
   dns="$(awk -F= 'tolower($1)=="dns"{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}' /etc/systemd/resolved.conf 2>/dev/null | head -n1 || true)"
   [[ -n "$dns" ]] || { echo "-"; return 0; }
@@ -175,20 +168,16 @@ dns_profile_from_resolved() {
 
 conntrack_max() { cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo "-"; }
 nofile_limit() {
-  # show systemd DefaultLimitNOFILE if present, otherwise current ulimit
   local v
   v="$(systemctl show --property DefaultLimitNOFILE 2>/dev/null | cut -d= -f2 || true)"
   [[ -n "$v" ]] && { echo "$v"; return 0; }
   ulimit -n 2>/dev/null || echo "-"
 }
 
-# parse kernel tuning asset log (it embeds upstream output)
 kernel_profile_from_log() {
-  # looks like: "Profile      | mid"
   grep -E '^[[:space:]]*Profile[[:space:]]+\|' "$L_KERNEL" 2>/dev/null | tail -n1 | awk -F'|' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}' || true
 }
 kernel_planned_from_log() {
-  # prints a few “Planned” lines if present
   awk '
     $0 ~ /^Planned \(computed targets\)/ {in=1; next}
     in && $0 ~ /^[A-Za-z]/ && $0 ~ /\|/ { print $0 }
@@ -203,21 +192,12 @@ remnanode_status() {
   command -v docker >/dev/null 2>&1 || { echo "-"; return 0; }
   docker ps --filter "name=remnanode" --format '{{.Status}}' 2>/dev/null | head -n1 || true
 }
-remnanode_uptime_compact() {
-  local st
-  st="$(remnanode_status)"
-  [[ -n "$st" ]] || { echo "-"; return 0; }
-  # Status is like "Up 3 minutes" / "Up 2 hours"
-  echo "$st"
-}
 remnanode_log_health() {
-  # very best-effort: if we see "error" in last 200 lines of /var/log/remnanode/*.log
   [[ -d /var/log/remnanode ]] || { echo "-"; return 0; }
   local last
   last="$(tail -n 200 /var/log/remnanode/*.log 2>/dev/null | tr '[:upper:]' '[:lower:]' | grep -E 'error|panic|fatal' | tail -n 1 || true)"
   [[ -n "$last" ]] && echo "⚠️ found errors (check /var/log/remnanode/*.log)" || echo "✅ no obvious errors (last 200 lines)"
 }
-
 remnanode_logrotate_policy() {
   if [[ -f /etc/logrotate.d/remnanode ]]; then
     awk 'NF{print}' /etc/logrotate.d/remnanode 2>/dev/null | sed 's/^/  /'
@@ -240,17 +220,36 @@ run_asset() {
   fi
   chmod +x "$tmp" >>"$log_file" 2>&1 || true
 
-  # Run asset (allow interactive via /dev/tty)
   set +e
   bash "$tmp" >>"$log_file" 2>&1
   local rc=$?
   set -e
 
-  if [[ $rc -eq 0 ]]; then
-    ok "${name} finished"
-  else
-    warn "${name} exited with code=${rc} (see ${log_file})"
+  [[ $rc -eq 0 ]] && ok "${name} finished" || warn "${name} exited with code=${rc} (see ${log_file})"
+  return "$rc"
+}
+
+# Same as run_asset but feeds stdin to asset
+run_asset_with_stdin() {
+  local name="$1" url="$2" log_file="$3" stdin_payload="$4"
+  local tmp="${ASSETS_TMP}/${name}.sh"
+
+  info "Running asset: ${name}"
+  : >"$log_file" || true
+
+  if ! curl -fsSL "$url" -o "$tmp" >>"$log_file" 2>&1; then
+    warn "${name} download failed: ${url}"
+    return 2
   fi
+  chmod +x "$tmp" >>"$log_file" 2>&1 || true
+
+  set +e
+  # Feed stdin exactly (for upstream read -p etc.)
+  printf "%b" "$stdin_payload" | bash "$tmp" >>"$log_file" 2>&1
+  local rc=$?
+  set -e
+
+  [[ $rc -eq 0 ]] && ok "${name} finished" || warn "${name} exited with code=${rc} (see ${log_file})"
   return "$rc"
 }
 
@@ -347,7 +346,6 @@ print_summary() {
   fi
   echo
 
-  # User block
   echo "👤 User"
   if [[ -n "${ARG_USER:-}" ]]; then
     echo "  🧑 Name     : ${ARG_USER}"
@@ -364,11 +362,10 @@ print_summary() {
   fi
   echo
 
-  # remnanode
   echo "🧩 remnanode"
   if command -v docker >/dev/null 2>&1; then
     local st
-    st="$(remnanode_uptime_compact)"
+    st="$(remnanode_status)"
     if [[ -n "$st" ]]; then
       echo "  🐳 Container : ${st}"
       echo "  📄 Logs      : $(remnanode_log_health)"
@@ -384,7 +381,6 @@ print_summary() {
   fi
   echo
 
-  # steps status
   echo "✅ Steps"
   echo "  📦 Packages     : $([[ $S_APT -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_APT)")"
   echo "  🌐 DNS switcher : $([[ $S_DNS -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_DNS)")"
@@ -409,6 +405,25 @@ print_summary() {
   echo "  🧠 $L_KERNEL"
 }
 
+usage() {
+  cat <<'EOF'
+Usage:
+  sudo ./vps-edge-run.sh apply [flags]
+
+Flags:
+  --user <name>
+  --timezone <TZ>              Default: Europe/Moscow
+  --reboot <0|skip|5m|30s|...> Default: 0 (no reboot)
+
+  --dns-switcher 0|1
+  --dns-profile 1..5           If set and dns-switcher=1 => auto-feed "y + profile"
+  --tailscale 0|1
+  --remnanode 0|1
+  --ssh-harden 0|1
+  --open-wan-443 0|1
+EOF
+}
+
 # -------------------------- Apply flow --------------------------
 apply_cmd() {
   need_root "$@"
@@ -427,10 +442,19 @@ apply_cmd() {
   # DNS
   if [[ "${ARG_DNS_SWITCHER}" == "1" ]]; then
     hdr "🌐 DNS switcher"
-    # Export vars for asset (so it can auto-feed y + profile)
-    export DNS_PROFILE="${ARG_DNS_PROFILE:-}"
-    if run_asset "dns-bootstrap" "$ASSET_DNS" "$L_DNS"; then S_DNS=0; else S_DNS=$?; fi
-    ok "dns-switcher applied (see $L_DNS)"
+    # If dns-profile provided -> auto-feed y + profile into the asset (no prompts)
+    if [[ -n "${ARG_DNS_PROFILE:-}" && "${ARG_DNS_PROFILE}" =~ ^[1-5]$ ]]; then
+      if run_asset_with_stdin "dns-bootstrap" "$ASSET_DNS" "$L_DNS" $'y\n'"${ARG_DNS_PROFILE}"$'\n'; then
+        S_DNS=0
+      else
+        S_DNS=$?
+      fi
+      ok "dns-switcher auto-applied (profile ${ARG_DNS_PROFILE}) (see $L_DNS)"
+    else
+      # No profile -> let user interact with upstream normally
+      if run_asset "dns-bootstrap" "$ASSET_DNS" "$L_DNS"; then S_DNS=0; else S_DNS=$?; fi
+      ok "dns-switcher applied (interactive) (see $L_DNS)"
+    fi
   fi
 
   # Tailscale
@@ -449,12 +473,7 @@ apply_cmd() {
       S_USER=0
     else
       S_USER=$?
-      # user-setup might be idempotent and return non-0 for “exists”, but we still continue
     fi
-
-    # Extract "created" + password from user-setup log (expected lines):
-    #   USER_CREATED=1
-    #   USER_PASS=...
     USER_CREATED="$(grep -E '^USER_CREATED=' "$L_USER" 2>/dev/null | tail -n1 | cut -d= -f2 | tr -d '\r' || echo 0)"
     USER_PASS="$(grep -E '^USER_PASS=' "$L_USER" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d '\r' || true)"
     [[ -z "${USER_CREATED:-}" ]] && USER_CREATED="0"
@@ -464,7 +483,7 @@ apply_cmd() {
   hdr "💅 Zsh"
   if run_asset "zsh-bootstrap" "$ASSET_ZSH" "$L_ZSH"; then S_ZSH=0; else S_ZSH=$?; fi
 
-  # Kernel tuning (do not stop whole run on non-zero; upstream can return 1 with rollback hint)
+  # Kernel tuning (do not stop on non-zero)
   hdr "🧠 Kernel + system tuning"
   if run_asset "kernel-bootstrap" "$ASSET_KERNEL" "$L_KERNEL"; then
     S_KERNEL=0
@@ -493,31 +512,8 @@ apply_cmd() {
     if run_asset "remnanode-bootstrap" "$ASSET_REMNANODE" "$L_REMNA"; then S_REMNA=0; else S_REMNA=$?; fi
   fi
 
-  # Final summary
   print_summary
-
-  # Reboot (optional)
   maybe_reboot
-}
-
-usage() {
-  cat <<'EOF'
-Usage:
-  sudo ./vps-edge-run.sh apply [flags]
-
-Flags:
-  --user <name>                Create/ensure user (asset user-setup), copy ssh keys, sudo NOPASSWD, docker group, /opt writable
-  --timezone <TZ>              Default: Europe/Moscow
-  --reboot <0|skip|5m|30s|...> Default: 0 (no reboot)
-
-  --dns-switcher 0|1           Run DNS switcher asset
-  --dns-profile 1..5           If passed and dns-switcher=1 => auto-apply this profile; else interactive upstream
-
-  --tailscale 0|1              Run tailscale setup asset
-  --remnanode 0|1              Run remnanode asset (compose + start + logrotate)
-  --ssh-harden 0|1             Run ssh+fail2ban asset
-  --open-wan-443 0|1           Run ufw asset (WAN allow 443 tcp/udp; outgoing allow all; tailscale allow all)
-EOF
 }
 
 # -------------------------- Main --------------------------
