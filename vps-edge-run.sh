@@ -176,8 +176,12 @@ ext_ip() {
 
 geo_lookup() {
   # Outputs: COUNTRY_CODE|COUNTRY|REGION|CITY|ORG
+  # jq is optional; without it we degrade gracefully.
+  command -v jq >/dev/null 2>&1 || { printf "||||"; return 0; }
+
   local ip="${1:-}"
   local out=""
+
   # ipinfo (no key)
   out="$(curl -fsSL --max-time 3 "https://ipinfo.io/${ip}/json" 2>/dev/null || true)"
   if [[ -n "$out" ]]; then
@@ -196,7 +200,7 @@ geo_lookup() {
   # ip-api fallback
   out="$(curl -fsSL --max-time 3 "http://ip-api.com/json/${ip}?fields=status,countryCode,country,regionName,city,as,isp,org" 2>/dev/null || true)"
   if [[ -n "$out" ]]; then
-    local status cc country region city as isp org
+    local status cc country region city as isp org prov
     status="$(printf "%s" "$out" | jq -r '.status // empty' 2>/dev/null || true)"
     if [[ "$status" == "success" ]]; then
       cc="$(printf "%s" "$out" | jq -r '.countryCode // empty' 2>/dev/null || true)"
@@ -206,7 +210,8 @@ geo_lookup() {
       as="$(printf "%s" "$out" | jq -r '.as // empty' 2>/dev/null || true)"
       isp="$(printf "%s" "$out" | jq -r '.isp // empty' 2>/dev/null || true)"
       org="$(printf "%s" "$out" | jq -r '.org // empty' 2>/dev/null || true)"
-      printf "%s|%s|%s|%s|%s" "${cc:-}" "${country:-}" "${region:-}" "${city:-}" "${as:-$org:-$isp}"
+      prov="$as"; [[ -z "$prov" ]] && prov="$org"; [[ -z "$prov" ]] && prov="$isp"
+      printf "%s|%s|%s|%s|%s" "${cc:-}" "${country:-}" "${region:-}" "${city:-}" "${prov:-}"
       return 0
     fi
   fi
@@ -444,9 +449,6 @@ SECRET_KEY=""
 DNS_SWITCHER_URL="${DNS_SWITCHER_URL:-https://raw.githubusercontent.com/AndreyTimoschuk/dns-switcher/main/dns-switcher.sh}"
 
 # Put these files in your repo and override via env if you want
-# Example:
-#   export ZSHRC_URL="https://raw.githubusercontent.com/<you>/<repo>/main/zshrc"
-#   export P10K_URL="https://raw.githubusercontent.com/<you>/<repo>/main/p10k"
 ZSHRC_URL="${ZSHRC_URL:-https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/main/zshrc}"
 P10K_URL="${P10K_URL:-https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/main/p10k}"
 
@@ -522,7 +524,6 @@ export NEEDRESTART_MODE=a
 
 aptq() {
   local what="$1"; shift
-  # shellcheck disable=SC2068
   if apt-get -y -qq -o Dpkg::Use-Pty=0 \
       -o Dpkg::Options::='--force-confdef' \
       -o Dpkg::Options::='--force-confold' \
@@ -557,7 +558,6 @@ docker_install() {
     return 0
   fi
 
-  # Ubuntu/Debian Docker CE repo install
   : >"$DOCKER_LOG" || true
   if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
     mkdir -p /etc/apt/keyrings
@@ -613,14 +613,12 @@ dns_apply() {
   fi
   chmod +x "$tmp" >>"$DNS_LOG" 2>&1 || true
 
-  # Feed: Y + profile
   if printf "y\n%s\n" "$profile" | bash "$tmp" >>"$DNS_LOG" 2>&1; then
     ok "dns-switcher applied (profile ${profile})"
   else
     warn "dns-switcher failed (see $DNS_LOG). Continuing."
   fi
 
-  # Summary similar to upstream
   local dns_line fb_line
   dns_line="$(awk -F= 'tolower($1)=="dns"{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}' /etc/systemd/resolved.conf 2>/dev/null | head -n1 || true)"
   fb_line="$(awk -F= 'tolower($1)=="fallbackdns"{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}' /etc/systemd/resolved.conf 2>/dev/null | head -n1 || true)"
@@ -659,7 +657,6 @@ tailscale_install_if_needed() {
 }
 
 tailscale_sysctl_tune() {
-  # keep minimal and avoid clobbering the later tuning logic
   install -m 0644 /dev/stdin /etc/sysctl.d/95-edge-tailscale.conf <<'EOF'
 net.ipv4.ip_forward=1
 net.ipv6.conf.all.forwarding=1
@@ -671,23 +668,19 @@ EOF
   local internet_iface=""
   internet_iface="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)"
   if [[ -n "$internet_iface" ]] && command -v ethtool >/dev/null 2>&1; then
-    # best-effort; warning from tailscale is OK
     ethtool -K "$internet_iface" gro on >/dev/null 2>&1 || true
     ethtool -K "$internet_iface" rx-udp-gro-forwarding on >/dev/null 2>&1 || true
   fi
 }
 
 tailscale_magicdns_name() {
-  # best-effort: parse "DNSName" from "tailscale status --json" if available
   local name=""
   if tailscale status --json >/dev/null 2>&1; then
     name="$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' 2>/dev/null || true)"
   fi
-  # fallback
   if [[ -z "$name" ]]; then
     name="$(tailscale status 2>/dev/null | awk 'NR==1{print $2}' | sed 's/^\(.*\)\.$/\1/' || true)"
   fi
-  # normalize trailing dot
   name="${name%.}"
   echo "$name"
 }
@@ -705,25 +698,15 @@ tailscale_apply() {
   tailscale_install_if_needed
   tailscale_sysctl_tune
 
-  # If already up, do not call "tailscale up" (avoids "mention all flags" error)
   if tailscale_is_up; then
     local ip name
     ip="$(tailscale_ip4)"
-    if [[ -n "$ip" ]]; then
-      ok "tailscale is up (ip ${ip})"
-    else
-      ok "tailscale is up"
-    fi
+    [[ -n "$ip" ]] && ok "tailscale is up (ip ${ip})" || ok "tailscale is up"
     name="$(tailscale_magicdns_name)"
-    if [[ -n "$name" ]]; then
-      ok "MagicDNS: ${name}"
-    else
-      warn "MagicDNS name not available (maybe disabled)."
-    fi
+    [[ -n "$name" ]] && ok "MagicDNS: ${name}" || warn "MagicDNS name not available (maybe disabled)."
     return 0
   fi
 
-  # Not up -> run minimal "tailscale up --ssh" and show auth link if needed
   : >"$TS_LOG" || true
   local out="/tmp/vps-edge-tailscale-up.log"
   rm -f "$out" 2>/dev/null || true
@@ -734,7 +717,6 @@ tailscale_apply() {
   set -e
 
   if [[ "$rc" -ne 0 ]]; then
-    # If already logged in but config mismatch -> don't fail hard, just instruct
     warn "tailscale up returned rc=${rc}. See: $TS_LOG"
   fi
 
@@ -748,7 +730,6 @@ tailscale_apply() {
     read_tty _ "Press Enter after you approve the device in Tailscale admin… "
   fi
 
-  # Wait until it becomes up (best-effort)
   local ip=""
   for _i in {1..30}; do
     ip="$(tailscale_ip4)"
@@ -756,19 +737,11 @@ tailscale_apply() {
     sleep 1
   done
 
-  if [[ -n "$ip" ]]; then
-    ok "tailscale is up (ip ${ip})"
-  else
-    warn "tailscale IP not detected (maybe still pending auth). You can re-run: tailscale up --ssh"
-  fi
+  [[ -n "$ip" ]] && ok "tailscale is up (ip ${ip})" || warn "tailscale IP not detected (maybe still pending auth). You can re-run: tailscale up --ssh"
 
   local name
   name="$(tailscale_magicdns_name)"
-  if [[ -n "$name" ]]; then
-    ok "MagicDNS: ${name}"
-  else
-    warn "MagicDNS name not available (maybe disabled)."
-  fi
+  [[ -n "$name" ]] && ok "MagicDNS: ${name}" || warn "MagicDNS name not available (maybe disabled)."
 }
 
 ###############################################################################
@@ -822,10 +795,8 @@ ensure_ohmyzsh_for_user() {
 
   [[ -d "$home" ]] || return 0
 
-  # Ensure shells list contains zsh
   grep -q '^/usr/bin/zsh$' /etc/shells 2>/dev/null || echo '/usr/bin/zsh' >> /etc/shells
 
-  # Install OMZ if missing
   if [[ ! -d "${home}/.oh-my-zsh" ]]; then
     if [[ "$uname" == "root" ]]; then
       RUNZSH=no KEEP_ZSHRC=yes CHSH=no sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" >>"$ERR_LOG" 2>&1 || true
@@ -834,7 +805,6 @@ ensure_ohmyzsh_for_user() {
     fi
   fi
 
-  # Plugins + theme
   local zsh_path="${home}/.oh-my-zsh"
   local zsh_custom="${zsh_path}/custom"
   mkdir -p "${zsh_custom}/plugins" "${zsh_custom}/themes" >>"$ERR_LOG" 2>&1 || true
@@ -871,7 +841,6 @@ ensure_ohmyzsh_for_user() {
     fi
   fi
 
-  # fzf
   if [[ ! -d "${home}/.fzf" ]]; then
     if [[ "$uname" == "root" ]]; then
       git clone --depth 1 https://github.com/junegunn/fzf.git "${home}/.fzf" >>"$ERR_LOG" 2>&1 || true
@@ -882,15 +851,9 @@ ensure_ohmyzsh_for_user() {
     fi
   fi
 
-  # Download zshrc + p10k
-  if curl -fsSL "$ZSHRC_URL" -o "${home}/.zshrc" >>"$ERR_LOG" 2>&1; then
-    true
-  fi
-  if curl -fsSL "$P10K_URL" -o "${home}/.p10k.zsh" >>"$ERR_LOG" 2>&1; then
-    true
-  fi
+  curl -fsSL "$ZSHRC_URL" -o "${home}/.zshrc" >>"$ERR_LOG" 2>&1 || true
+  curl -fsSL "$P10K_URL" -o "${home}/.p10k.zsh" >>"$ERR_LOG" 2>&1 || true
 
-  # FZF_BASE fallback
   if [[ -f "${home}/.zshrc" ]] && ! grep -q 'FZF_BASE=' "${home}/.zshrc" 2>/dev/null; then
     cat >> "${home}/.zshrc" <<'EOF_FZF'
 # Linux fallback for oh-my-zsh fzf plugin
@@ -900,10 +863,8 @@ fi
 EOF_FZF
   fi
 
-  # Disable update prompts
   zsh_disable_update_prompts "${home}/.zshrc"
 
-  # Ownership + default shell
   if [[ "$uname" == "root" ]]; then
     chown root:root "${home}/.zshrc" "${home}/.p10k.zsh" 2>/dev/null || true
     chsh -s /usr/bin/zsh root >/dev/null 2>&1 || true
@@ -915,9 +876,7 @@ EOF_FZF
 
 zsh_apply_all_users() {
   hdr "💅 Zsh for all /home/* users"
-
-  # Ensure packages for zsh stack exist
-  aptq "Install zsh stack packages" install zsh git curl wget ca-certificates jq >/dev/null 2>&1 || true
+  aptq "Install zsh stack packages" install zsh git curl wget ca-certificates jq
 
   local homes=()
   while IFS= read -r -d '' d; do homes+=("$d"); done < <(find /home -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null || true)
@@ -929,7 +888,6 @@ zsh_apply_all_users() {
     ok "zsh stack ensured for $u"
   done
 
-  # root too
   ensure_ohmyzsh_for_user "root" "/root"
   ok "zsh stack ensured for root"
 }
@@ -983,7 +941,6 @@ ufw_apply() {
   ufw default deny incoming >/dev/null 2>&1 || true
   ufw default allow outgoing >/dev/null 2>&1 || true
 
-  # WAN: only 443 if enabled
   if [[ "${ARG_OPEN_WAN_443}" == "1" ]]; then
     ufw allow in on "$internet_iface" to any port 443 proto tcp >/dev/null 2>&1 || true
     ufw allow in on "$internet_iface" to any port 443 proto udp >/dev/null 2>&1 || true
@@ -992,7 +949,6 @@ ufw_apply() {
     warn "WAN (${internet_iface}): no inbound ports opened (open-wan-443=0)"
   fi
 
-  # Tailscale: allow all
   if ip link show tailscale0 >/dev/null 2>&1; then
     ufw allow in on tailscale0 >/dev/null 2>&1 || true
     ufw allow out on tailscale0 >/dev/null 2>&1 || true
@@ -1001,7 +957,6 @@ ufw_apply() {
     warn "tailscale0 not found (tailscale disabled or not up yet)."
   fi
 
-  # Docker bridges
   local docker_ifaces=""
   docker_ifaces="$(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^(docker0|br-)/ {print $2}' || true)"
   if [[ -n "$docker_ifaces" ]]; then
@@ -1104,12 +1059,39 @@ EOF
     ok "remnanode compose exists: ${compose}"
   fi
 
-  # Start
   if (cd "$dir" && docker compose up -d) >>"$ERR_LOG" 2>&1; then
     ok "remnanode started"
+    return 0
   else
     warn "remnanode start failed (see $ERR_LOG)"
+    return 1
   fi
+}
+
+remnanode_logrotate_apply() {
+  hdr "🗂️  Remnanode logrotate"
+
+  # logrotate is typically installed via base packages, but keep it explicit + idempotent
+  aptq "Ensure logrotate installed" install logrotate
+
+  mkdir -p /var/log/remnanode
+
+  backup_file /etc/logrotate.d/remnanode
+  cat >/etc/logrotate.d/remnanode <<'EOF'
+/var/log/remnanode/*.log {
+    size 50M
+    rotate 5
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+  ok "logrotate config written: /etc/logrotate.d/remnanode"
+
+  # Force test (do not fail apply if log files are empty / missing)
+  logrotate -vf /etc/logrotate.d/remnanode >>"$ERR_LOG" 2>&1 || true
+  ok "logrotate test completed"
 }
 
 remnanode_status_line() {
@@ -1124,7 +1106,6 @@ remnanode_status_line() {
 tuning_apply() {
   hdr "🧠 Kernel + system tuning"
 
-  # Discover resources
   local mem_kb mem_mb cpu
   mem_kb="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)"
   mem_mb="$((mem_kb / 1024))"
@@ -1147,7 +1128,6 @@ tuning_apply() {
   pick_log_caps "$disk_mb"
   local j_system="$J_SYSTEM" j_runtime="$J_RUNTIME" logrotate_rotate="$LR_ROTATE"
 
-  # Defaults by profile
   local somaxconn netdev_backlog syn_backlog rmem_max wmem_max rmem_def wmem_def tcp_rmem tcp_wmem
   local swappiness nofile_profile tw_profile
   local ct_min ct_cap
@@ -1232,7 +1212,6 @@ tuning_apply() {
       ;;
   esac
 
-  # Never decrease
   local current_ct current_tw current_nofile
   current_ct="$(to_int "$B_CT_MAX")"
   current_tw="$(to_int "$B_TW")"
@@ -1248,7 +1227,6 @@ tuning_apply() {
   ct_final="$(imax "$current_ct" "$ct_clamped")"
   local ct_buckets=$((ct_final/4)); [[ "$ct_buckets" -lt 4096 ]] && ct_buckets=4096
 
-  # ---- swap sizing ----
   backup_file /etc/fstab
   local swap_gb=2
   if   [[ "$mem_mb" -lt 2048  ]]; then swap_gb=1
@@ -1298,7 +1276,6 @@ tuning_apply() {
     fi
   fi
 
-  # ---- sysctl ----
   backup_file /etc/sysctl.conf
   shopt -s nullglob
   for f in /etc/sysctl.d/*.conf; do
@@ -1371,7 +1348,6 @@ EOM
 
   sysctl --system >/dev/null 2>&1 || true
 
-  # ---- NOFILE ----
   mkdir -p /etc/systemd/system.conf.d
   shopt -s nullglob
   for f in /etc/systemd/system.conf.d/*.conf; do
@@ -1402,7 +1378,6 @@ EOM
 
   systemctl daemon-reexec >/dev/null 2>&1 || true
 
-  # ---- journald ----
   mkdir -p /etc/systemd/journald.conf.d
   shopt -s nullglob
   for f in /etc/systemd/journald.conf.d/*.conf; do
@@ -1421,7 +1396,6 @@ RateLimitBurst=1000
 EOM
   systemctl restart systemd-journald >/dev/null 2>&1 || true
 
-  # ---- unattended-upgrades ----
   mkdir -p /etc/apt/apt.conf.d
   backup_file /etc/apt/apt.conf.d/99-edge-unattended.conf
   cat > /etc/apt/apt.conf.d/99-edge-unattended.conf <<'EOM'
@@ -1429,7 +1403,6 @@ Unattended-Upgrade::Automatic-Reboot "false";
 Unattended-Upgrade::Automatic-Reboot-Time "04:00";
 EOM
 
-  # ---- logrotate ----
   backup_file /etc/logrotate.conf
   cat > /etc/logrotate.conf <<EOM
 daily
@@ -1477,7 +1450,6 @@ EOM
 }
 EOM
 
-  # ---- tmpfiles ----
   mkdir -p /etc/tmpfiles.d
   backup_file /etc/tmpfiles.d/edge-tmp.conf
   cat > /etc/tmpfiles.d/edge-tmp.conf <<'EOM'
@@ -1486,7 +1458,6 @@ D /var/tmp        1777 root root 14d
 EOM
   systemd-tmpfiles --create >/dev/null 2>&1 || true
 
-  # Keep for summary
   HW_PROFILE="$profile"
   HW_TIER="$tier"
   HW_CPU="$cpu"
@@ -1567,7 +1538,6 @@ apply_cmd() {
   mkbackup
   snapshot_before
 
-  # If args empty -> interactive defaults
   if [[ -z "${ARG_USER}" ]]; then
     if [[ -t 0 ]]; then
       read_tty ARG_USER "User to create/ensure (leave empty to skip): "
@@ -1624,42 +1594,35 @@ apply_cmd() {
     fi
   fi
 
-  # If remnanode requested -> collect inputs early only if compose missing
   if [[ "${ARG_REMNANODE}" == "1" ]]; then
     remnanode_collect_inputs_early
   fi
 
-  print_start_end_banner "🏁 Start"
-
-  # APT + base packages (always includes iperf3, mc, git, jq)
   ensure_packages "📦 Packages" \
     curl wget ca-certificates gnupg lsb-release apt-transport-https \
     jq iproute2 ethtool openssl logrotate cron ufw iperf3 git zsh mc
 
+  print_start_end_banner "🏁 Start"
+
   timezone_apply
 
-  # DNS early (optional)
   if [[ "${ARG_DNS_SWITCHER}" == "1" ]]; then
     dns_apply
   fi
 
-  # Tailscale early (optional)
   if [[ "${ARG_TAILSCALE}" == "1" ]]; then
     tailscale_apply
   fi
 
-  # Docker if needed for remnanode or just ensure present for user group
   if [[ "${ARG_REMNANODE}" == "1" ]]; then
     docker_install
   else
-    # no-op if already installed
     if command -v docker >/dev/null 2>&1; then
       hdr "🐳 Docker"
       ok "docker already installed"
     fi
   fi
 
-  # User (optional)
   if [[ -n "${ARG_USER}" ]]; then
     create_or_ensure_user "${ARG_USER}"
   else
@@ -1667,29 +1630,23 @@ apply_cmd() {
     USER_PASS=""
   fi
 
-  # Zsh for all users
   zsh_apply_all_users
 
-  # System tuning
   tuning_apply
 
-  # SSH hardening
   if [[ "${ARG_SSH_HARDEN}" == "1" ]]; then
     ssh_harden_apply
   fi
 
-  # Firewall
   ufw_apply
 
-  # iperf3 server always
   iperf3_server_apply
 
-  # remnanode
   if [[ "${ARG_REMNANODE}" == "1" ]]; then
     remnanode_apply
+    remnanode_logrotate_apply
   fi
 
-  # Autoremove
   hdr "🧹 Autoremove"
   aptq "Autoremove" autoremove --purge
 
@@ -1700,7 +1657,6 @@ apply_cmd() {
   print_before_after_all
   print_manifest_compact "$manifest"
 
-  # Summary table
   local ts_ip ts_name
   ts_ip=""
   ts_name=""
@@ -1758,7 +1714,6 @@ rollback_cmd() {
 
   local backup="${BACKUP_DIR:-}"
   if [[ -z "$backup" ]]; then
-    # allow --backup-dir=... too
     if [[ "${1:-}" =~ ^--backup-dir= ]]; then
       backup="${1#*=}"
     fi
@@ -1780,6 +1735,7 @@ rollback_cmd() {
         /etc/systemd/journald.conf.d/90-edge.conf \
         /etc/apt/apt.conf.d/99-edge-unattended.conf \
         /etc/logrotate.d/edge-all-text-logs \
+        /etc/logrotate.d/remnanode \
         /etc/tmpfiles.d/edge-tmp.conf \
         /etc/systemd/system/iperf3.service 2>/dev/null || true
 
@@ -1796,7 +1752,6 @@ rollback_cmd() {
   systemctl restart systemd-journald >/dev/null 2>&1 || true
   systemctl daemon-reload >/dev/null 2>&1 || true
 
-  # best-effort: stop iperf3 service if exists
   systemctl disable --now iperf3 >/dev/null 2>&1 || true
 
   snapshot_after
