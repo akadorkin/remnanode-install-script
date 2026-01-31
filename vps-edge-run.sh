@@ -2,14 +2,33 @@
 set -Eeuo pipefail
 
 ###############################################################################
-# vps-edge-run.sh
+# VPS Edge Router / Node Bootstrap Script
+#
+# ABSOLUTELY NO WARRANTY:
+# This script modifies system settings (kernel/sysctl, SSH, firewall, logs, etc).
+# You run it at your own risk. It may break networking, access (SSH), services,
+# or performance depending on your environment. Always test on a fresh VM first.
+###############################################################################
+
+###############################################################################
+# Goals (apply):
 # - DNS switcher (optional, early)
-# - Tailscale (optional, early; idempotent; no exit-node; no auth key)
-# - Docker + remnanode (optional; early inputs only if compose missing)
-# - User (optional/interactive) + Zsh stack for all /home/* users + root
-# - Kernel/system tuning with backup+rollback (tiered)
+# - Tailscale (optional, early; idempotent; safe waiting for Running+IPv4)
+# - Node Exporter install (optional; runs "in background" from script POV)
+# - Docker + remnanode (optional)
+# - Zsh stack for all /home/* users + root (optional-ish, enabled by default)
+# - Kernel/system tuning with backup+rollback
 # - UFW: WAN only 443 (optional), Tailscale allow-all, Docker bridges allow-all
-# - iperf3 installed always + systemd server enabled always
+# - iperf3 server enabled always
+#
+# Commands:
+#   apply    apply tuning and create a backup
+#   rollback undo changes using a backup
+#   status   show current tuning state
+#
+# Works best on:
+# - Ubuntu 20.04/22.04/24.04 LTS (tested)
+# - Debian 11/12 should mostly work, but unattended-upgrades/pam paths may differ.
 ###############################################################################
 
 ###############################################################################
@@ -28,11 +47,7 @@ c_yel=$'\033[33m'
 c_grn=$'\033[32m'
 c_cyan=$'\033[36m'
 
-color() { # color <ansi> <text>
-  local code="$1"; shift
-  if _is_tty; then printf "%s%s%s" "$code" "$*" "$c_reset"; else printf "%s" "$*"; fi
-}
-
+color() { local code="$1"; shift; if _is_tty; then printf "%s%s%s" "$code" "$*" "$c_reset"; else printf "%s" "$*"; fi; }
 _pfx() { _is_tty && printf "%s%s%s" "${c_dim}" "$(ts) " "${c_reset}" || true; }
 ok()   { _pfx; color "$c_grn" "✅ OK";    printf " %s\n" "$*"; }
 info() { _pfx; color "$c_cyan" "ℹ️ ";     printf " %s\n" "$*"; }
@@ -41,7 +56,6 @@ err()  { _pfx; color "$c_red" "🛑 ERROR"; printf " %s\n" "$*"; }
 die()  { err "$*"; exit 1; }
 
 hdr() { echo; color "$c_bold$c_cyan" "$*"; echo; }
-
 host_short() { hostname -s 2>/dev/null || hostname; }
 
 ###############################################################################
@@ -65,9 +79,7 @@ need_root() {
 }
 
 ###############################################################################
-# TTY input helpers
-# IMPORTANT: must work even when script is piped (curl | sudo bash).
-# We read from /dev/tty when available.
+# TTY input helpers (works even when piped)
 ###############################################################################
 read_tty() {
   local __var="$1" __prompt="$2" __v=""
@@ -76,7 +88,6 @@ read_tty() {
     printf -v "$__var" '%s' "$__v"
     return 0
   fi
-  # no tty available (non-interactive)
   printf -v "$__var" '%s' ""
   return 0
 }
@@ -152,41 +163,23 @@ restore_manifest() {
   done < "$man"
 }
 
-latest_backup_dir() {
-  ls -1dt /root/edge-tuning-backup-* 2>/dev/null | head -n1 || true
-}
+latest_backup_dir() { ls -1dt /root/edge-tuning-backup-* 2>/dev/null | head -n1 || true; }
 
 ###############################################################################
 # Numeric helpers
 ###############################################################################
 to_int() { local s="${1:-}"; [[ "$s" =~ ^[0-9]+$ ]] && echo "$s" || echo 0; }
-imax() { local a b; a="$(to_int "${1:-0}")"; b="$(to_int "${2:-0}")"; [[ "$a" -ge "$b" ]] && echo "$a" || echo "$b"; }
-clamp() {
-  local v lo hi
-  v="$(to_int "${1:-0}")"
-  lo="$(to_int "${2:-0}")"
-  hi="$(to_int "${3:-0}")"
-  [[ "$v" -lt "$lo" ]] && v="$lo"
-  [[ "$v" -gt "$hi" ]] && v="$hi"
-  echo "$v"
-}
+clamp() { local v lo hi; v="$(to_int "${1:-0}")"; lo="$(to_int "${2:-0}")"; hi="$(to_int "${3:-0}")"; [[ "$v" -lt "$lo" ]] && v="$lo"; [[ "$v" -gt "$hi" ]] && v="$hi"; echo "$v"; }
 
 ###############################################################################
 # Geo/ISP helpers (best-effort)
 ###############################################################################
 country_flag() {
-  local cc="${1:-}"
-  cc="${cc^^}"
-  if [[ ! "$cc" =~ ^[A-Z]{2}$ ]]; then
-    printf "🏳️"
-    return 0
-  fi
-
+  local cc="${1:-}"; cc="${cc^^}"
+  if [[ ! "$cc" =~ ^[A-Z]{2}$ ]]; then printf "🏳️"; return 0; fi
   awk -v cc="$cc" 'BEGIN{
-    o1 = ord(substr(cc,1,1))
-    o2 = ord(substr(cc,2,1))
-    cp1 = 0x1F1E6 + o1 - 65
-    cp2 = 0x1F1E6 + o2 - 65
+    o1 = ord(substr(cc,1,1)); o2 = ord(substr(cc,2,1));
+    cp1 = 0x1F1E6 + o1 - 65; cp2 = 0x1F1E6 + o2 - 65;
     printf "%c%c", cp1, cp2
   }
   function ord(c){ return index("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c)+64 }'
@@ -202,10 +195,10 @@ geo_lookup() {
   # Outputs: COUNTRY_CODE|COUNTRY|REGION|CITY|ORG
   local ip="${1:-}"
   local out=""
-  # ipinfo (no key)
+
   out="$(curl -fsSL --max-time 3 "https://ipinfo.io/${ip}/json" 2>/dev/null || true)"
   if [[ -n "$out" ]]; then
-    local cc country region city org
+    local cc region city org country
     cc="$(printf "%s" "$out" | jq -r '.country // empty' 2>/dev/null || true)"
     region="$(printf "%s" "$out" | jq -r '.region // empty' 2>/dev/null || true)"
     city="$(printf "%s" "$out" | jq -r '.city // empty' 2>/dev/null || true)"
@@ -217,7 +210,6 @@ geo_lookup() {
     fi
   fi
 
-  # ip-api fallback
   out="$(curl -fsSL --max-time 3 "http://ip-api.com/json/${ip}?fields=status,countryCode,country,regionName,city,as,isp,org" 2>/dev/null || true)"
   if [[ -n "$out" ]]; then
     local status cc country region city as isp org
@@ -239,20 +231,14 @@ geo_lookup() {
 }
 
 ###############################################################################
-# Snapshots (before/after)
+# Snapshot helpers (before/after)
 ###############################################################################
 _swap_state() {
   local s
   s="$(/sbin/swapon --noheadings --show=NAME,SIZE 2>/dev/null | awk '{$1=$1; print}' | tr '\n' ';' | sed 's/;$//' || true)"
   [[ -n "$s" ]] && echo "$s" || echo "none"
 }
-
-_nofile_systemd() {
-  local n
-  n="$(systemctl show --property DefaultLimitNOFILE 2>/dev/null | cut -d= -f2 || true)"
-  echo "${n:--}"
-}
-
+_nofile_systemd() { systemctl show --property DefaultLimitNOFILE 2>/dev/null | cut -d= -f2 || echo "-"; }
 _journald_caps() {
   local f="/etc/systemd/journald.conf.d/90-edge.conf"
   if [[ -f "$f" ]]; then
@@ -263,7 +249,6 @@ _journald_caps() {
   fi
   echo "-"
 }
-
 _logrotate_mode() {
   local f="/etc/logrotate.conf"
   [[ -f "$f" ]] || { echo "-"; return 0; }
@@ -272,7 +257,6 @@ _logrotate_mode() {
   rot="$(awk 'tolower($1)=="rotate"{print $2; exit}' "$f" 2>/dev/null || true)"
   echo "${freq:-?} / rotate ${rot:-?}"
 }
-
 _unattended_reboot_setting() {
   local reboot time
   reboot="$(grep -Rhs 'Unattended-Upgrade::Automatic-Reboot' /etc/apt/apt.conf.d/*.conf 2>/dev/null \
@@ -315,10 +299,9 @@ snapshot_after() {
 }
 
 ###############################################################################
-# Tier selection (RAM + CPU) + disk-aware log caps
+# Tier selection + disk-aware log caps
 ###############################################################################
 ceil_gib() { local mem_mb="$1"; echo $(( (mem_mb + 1023) / 1024 )); }
-
 ceil_to_tier() {
   local x="$1"
   if   [[ "$x" -le 1  ]]; then echo 1
@@ -330,7 +313,6 @@ ceil_to_tier() {
   else echo 64
   fi
 }
-
 profile_from_tier() {
   local t="$1"
   case "$t" in
@@ -343,34 +325,12 @@ profile_from_tier() {
     *)  echo "dedicated+" ;;
   esac
 }
-
-tier_rank() {
-  case "$1" in
-    1) echo 1 ;;
-    2) echo 2 ;;
-    4) echo 3 ;;
-    8) echo 4 ;;
-    16) echo 5 ;;
-    32) echo 6 ;;
-    *) echo 7 ;;
-  esac
-}
-tier_max() {
-  local a="$1" b="$2"
-  local ra rb
-  ra="$(tier_rank "$a")"; rb="$(tier_rank "$b")"
-  if [[ "$ra" -ge "$rb" ]]; then echo "$a"; else echo "$b"; fi
-}
-
-# Conntrack soft formula:
-# ct_soft = RAM_MiB * 64 + CPU * 8192
 ct_soft_from_ram_cpu() {
   local mem_mb="$1" cpu="$2"
   local ct=$(( mem_mb * 64 + cpu * 8192 ))
   [[ "$ct" -lt 32768 ]] && ct=32768
   echo "$ct"
 }
-
 disk_size_mb_for_logs() {
   local mb=""
   mb="$(df -Pm /var/log 2>/dev/null | awk 'NR==2{print $2}' || true)"
@@ -378,11 +338,6 @@ disk_size_mb_for_logs() {
   [[ -n "$mb" ]] || mb="0"
   echo "$mb"
 }
-
-disk_root_mb() {
-  df -Pm / 2>/dev/null | awk 'NR==2{print $2}' || echo 0
-}
-
 pick_log_caps() {
   local disk_mb="$1"
   J_SYSTEM="100M"; J_RUNTIME="50M"; LR_ROTATE="7"
@@ -437,7 +392,6 @@ print_manifest_compact() {
   local copies moves
   copies="$(awk -F'\t' '$1=="COPY"{c++} END{print c+0}' "$man" 2>/dev/null || echo 0)"
   moves="$(awk -F'\t' '$1=="MOVE"{c++} END{print c+0}' "$man" 2>/dev/null || echo 0)"
-
   hdr "📦 Files"
   echo "  backed up (COPY): $copies"
   echo "  moved aside:      $moves"
@@ -448,40 +402,39 @@ print_manifest_compact() {
 ###############################################################################
 CMD="${1:-}"; shift || true
 
-# Defaults: interactive unless explicitly provided
 ARG_USER=""
 ARG_TIMEZONE="Europe/Moscow"
 ARG_REBOOT="5m"
 
-ARG_TAILSCALE=""         # 0/1, if empty -> interactive
-ARG_DNS_SWITCHER=""      # 0/1, if empty -> interactive
-ARG_DNS_PROFILE="1"      # 1..5 (dns-switcher menu)
-ARG_REMNANODE=""         # 0/1, if empty -> interactive
-ARG_SSH_HARDEN=""        # 0/1, if empty -> interactive
-ARG_OPEN_WAN_443=""      # 0/1, if empty -> interactive
+ARG_TAILSCALE=""         # 0/1; interactive if empty
+ARG_DNS_SWITCHER=""      # 0/1; interactive if empty
+ARG_DNS_PROFILE="1"      # 1..5
+ARG_REMNANODE=""         # 0/1; interactive if empty
+ARG_SSH_HARDEN=""        # 0/1; interactive if empty
+ARG_OPEN_WAN_443=""      # 0/1; interactive if empty
+ARG_NODE_EXPORTER=""     # 0/1; interactive if empty
+ARG_ZSH_ALL_USERS=""     # 0/1; interactive if empty
 
-# remnanode inputs (asked early if needed)
 NODE_PORT="${NODE_PORT:-}"
 SECRET_KEY="${SECRET_KEY:-}"
 SKIP_REMNANODE_INPUTS="0"
 
-# URLs
 DNS_SWITCHER_URL="${DNS_SWITCHER_URL:-https://raw.githubusercontent.com/AndreyTimoschuk/dns-switcher/main/dns-switcher.sh}"
 
-# Put these files in your repo and override via env if you want
 ZSHRC_URL="${ZSHRC_URL:-https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/main/zshrc}"
 P10K_URL="${P10K_URL:-https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/main/p10k}"
 
-# Logs
+NODE_EXPORTER_INSTALL_CMD='bash <(curl -fsSL raw.githubusercontent.com/hteppl/sh/master/node_install.sh)'
+
 APT_LOG="/var/log/vps-edge-apt.log"
 DNS_LOG="/var/log/vps-edge-dns-switcher.log"
 TS_LOG="/var/log/vps-edge-tailscale.log"
 DOCKER_LOG="/var/log/vps-edge-docker.log"
+NODE_EXPORTER_LOG="/var/log/vps-edge-node-exporter.log"
 ERR_LOG="/var/log/vps-edge-error.log"
 
-touch "$APT_LOG" "$DNS_LOG" "$TS_LOG" "$DOCKER_LOG" "$ERR_LOG" 2>/dev/null || true
+touch "$APT_LOG" "$DNS_LOG" "$TS_LOG" "$DOCKER_LOG" "$NODE_EXPORTER_LOG" "$ERR_LOG" 2>/dev/null || true
 
-# Parse flags after command
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --user=*)          ARG_USER="${1#*=}"; shift ;;
@@ -493,6 +446,8 @@ while [[ $# -gt 0 ]]; do
     --remnanode=*)     ARG_REMNANODE="${1#*=}"; shift ;;
     --ssh-harden=*)    ARG_SSH_HARDEN="${1#*=}"; shift ;;
     --open-wan-443=*)  ARG_OPEN_WAN_443="${1#*=}"; shift ;;
+    --node-exporter=*) ARG_NODE_EXPORTER="${1#*=}"; shift ;;
+    --zsh-all-users=*) ARG_ZSH_ALL_USERS="${1#*=}"; shift ;;
 
     --user)          ARG_USER="${2:-}"; shift 2 ;;
     --timezone)      ARG_TIMEZONE="${2:-}"; shift 2 ;;
@@ -503,10 +458,9 @@ while [[ $# -gt 0 ]]; do
     --remnanode)     ARG_REMNANODE="${2:-}"; shift 2 ;;
     --ssh-harden)    ARG_SSH_HARDEN="${2:-}"; shift 2 ;;
     --open-wan-443)  ARG_OPEN_WAN_443="${2:-}"; shift 2 ;;
-
-    *)
-      die "Unknown arg: $1"
-      ;;
+    --node-exporter) ARG_NODE_EXPORTER="${2:-}"; shift 2 ;;
+    --zsh-all-users) ARG_ZSH_ALL_USERS="${2:-}"; shift 2 ;;
+    *) die "Unknown arg: $1" ;;
   esac
 done
 
@@ -525,17 +479,20 @@ Flags (apply):
   --dns-switcher 0|1           Run DNS switcher early
   --dns-profile 1..5           DNS switcher profile (default: 1)
 
-  --tailscale 0|1              Install/up tailscale early (no exit-node, no auth key)
+  --tailscale 0|1              Install/up tailscale early (no exit-node; no auth key)
+  --node-exporter 0|1          Install Node Exporter using:
+                                 bash <(curl -fsSL raw.githubusercontent.com/hteppl/sh/master/node_install.sh)
+
   --remnanode 0|1              Ensure /opt/remnanode + compose + start container
   --ssh-harden 0|1             PasswordAuthentication no, PermitRootLogin no
-  --open-wan-443 0|1           WAN UFW allow only 443 (tcp+udp). Tailscale allow-all is mandatory when enabled.
+  --open-wan-443 0|1           WAN UFW allow only 443 (tcp+udp).
+                               If tailscale is enabled but NOT ready, UFW will be skipped.
+
+  --zsh-all-users 0|1          Ensure oh-my-zsh + p10k for all /home/* users + root (default: 1)
 
 Notes:
   - Interactive prompts work even when piped (curl | sudo bash) because we read from /dev/tty.
-
-Examples:
-  sudo ./vps-edge-run.sh apply
-  sudo ./vps-edge-run.sh apply --reboot=skip --tailscale=1 --dns-switcher=1 --dns-profile=1 --remnanode=1 --ssh-harden=1 --open-wan-443=1 --user admin
+  - Rollback restores files from MANIFEST and removes our extra drop-ins.
 EOF
 }
 
@@ -567,7 +524,7 @@ ensure_packages() {
 }
 
 ###############################################################################
-# Detect distro (we assume Ubuntu/Debian-family)
+# Detect distro
 ###############################################################################
 is_debian_like() { command -v apt-get >/dev/null 2>&1; }
 
@@ -616,11 +573,10 @@ timezone_apply() {
 }
 
 ###############################################################################
-# DNS switcher (auto-yes + choose profile) with summary/tips
+# DNS switcher
 ###############################################################################
 dns_apply() {
   hdr "🌐 DNS switcher (early)"
-
   local profile="${ARG_DNS_PROFILE:-1}"
   [[ "$profile" =~ ^[1-5]$ ]] || profile="1"
 
@@ -659,24 +615,18 @@ dns_apply() {
 }
 
 ###############################################################################
-# Tailscale (quiet; idempotent; must end with a working IPv4 on tailscale0)
-# - If tailscale0 exists but has no IPv4 -> purge + reinstall via install.sh
-# - Prints auth URL (via tailscale login) ONLY if device needs login
-# - Waits for Enter on /dev/tty (if available)
+# Tailscale (reliable AuthURL + reliable waiting)
 ###############################################################################
 tailscale_install_if_needed() {
   : >"$TS_LOG" 2>/dev/null || true
-
   if command -v tailscale >/dev/null 2>&1; then
     ok "tailscale already installed"
     return 0
   fi
-
   if curl -fsSL https://tailscale.com/install.sh | sh >>"$TS_LOG" 2>&1; then
     ok "tailscale installed"
     return 0
   fi
-
   warn "tailscale install failed (see $TS_LOG)"
   return 1
 }
@@ -715,35 +665,22 @@ tailscale_magicdns_name() {
   echo "$name"
 }
 
-tailscale_is_up() { tailscale status >/dev/null 2>&1; }
 tailscale_ip4() { tailscale ip -4 2>/dev/null | head -n1 || true; }
-
-tailscale_iface_has_ipv4() {
-  ip -4 addr show dev tailscale0 2>/dev/null | grep -qE '\binet\s' && return 0
-  return 1
-}
-
+tailscale_iface_has_ipv4() { ip -4 addr show dev tailscale0 2>/dev/null | grep -qE '\binet\s' && return 0; return 1; }
 tailscale0_present() { ip link show tailscale0 >/dev/null 2>&1; }
 
 tailscale_need_reinstall() {
-  # broken signature: tailscale0 exists but has only IPv6 link-local (no IPv4)
   if tailscale0_present; then
-    if ! tailscale_iface_has_ipv4; then
-      return 0
-    fi
+    if ! tailscale_iface_has_ipv4; then return 0; fi
   fi
   return 1
 }
 
 tailscale_reinstall_if_broken() {
-  if ! tailscale_need_reinstall; then
-    return 0
-  fi
-
+  if ! tailscale_need_reinstall; then return 0; fi
   warn "tailscale0 has no IPv4 (looks broken) -> reinstalling tailscale first"
   : >"$TS_LOG" 2>/dev/null || true
 
-  # Best-effort stop and purge
   systemctl stop tailscaled >>"$TS_LOG" 2>&1 || true
 
   if command -v apt-get >/dev/null 2>&1; then
@@ -763,71 +700,32 @@ tailscale_reinstall_if_broken() {
   tailscale_restart_daemon
 }
 
-# --- NEW: explicit auth check via BackendState (idempotent, no forced logout) ---
-tailscale_backend_state() {
-  # Running | NeedsLogin | Stopped | ...
-  tailscale status --json 2>/dev/null | jq -r '.BackendState // empty' 2>/dev/null || true
+tailscale_backend_state() { tailscale status --json 2>/dev/null | jq -r '.BackendState // "NoState"' 2>/dev/null || echo "NoState"; }
+tailscale_auth_url_json() { tailscale status --json 2>/dev/null | jq -r '.AuthURL // empty' 2>/dev/null || true; }
+
+tailscale_login_qr_emit() {
+  : >"$TS_LOG" 2>/dev/null || true
+  local cmd=("tailscale" "login" "--qr")
+  if command -v stdbuf >/dev/null 2>&1; then cmd=("stdbuf" "-oL" "-eL" "tailscale" "login" "--qr"); fi
+  "${cmd[@]}" 2>&1 | tee -a "$TS_LOG" || true
 }
 
-tailscale_is_authorized() {
-  local st
-  st="$(tailscale_backend_state)"
-  [[ "$st" == "Running" ]] && return 0
-  return 1
-}
-
-tailscale_print_auth_url_and_wait() {
-  # If already authorized -> no-op
-  if tailscale_is_authorized; then
-    ok "tailscale already authorized (BackendState=Running) -> skip login"
-    return 0
-  fi
-
-  local out="/tmp/vps-edge-tailscale-login.log"
-  rm -f "$out" 2>/dev/null || true
-
-  info "Tailscale needs login -> running 'tailscale login' to obtain auth URL"
-
-  set +e
-  tailscale login 2>&1 | tee "$out" >>"$TS_LOG"
-  set -e
-
-  local url=""
-  url="$(grep -Eo 'https://login\.tailscale\.com/[a-zA-Z0-9/_-]+' "$out" | head -n1 || true)"
-
-  if [[ -n "$url" ]]; then
-    echo
-    echo "🔗 Authenticate Tailscale in browser:"
-    echo "   $url"
-    echo
-    if _has_dev_tty; then
-      read_tty _ "Press Enter after you approve the device in Tailscale admin… "
-    else
-      warn "No /dev/tty available to wait for confirmation."
+tailscale_wait_running_and_ipv4() {
+  local max="${1:-180}"
+  local i st ip
+  for ((i=1; i<=max; i++)); do
+    st="$(tailscale_backend_state)"
+    ip="$(tailscale_ip4)"
+    if [[ "$st" == "Running" ]] && [[ -n "${ip:-}" ]] && tailscale_iface_has_ipv4; then
+      echo "$ip"; return 0
     fi
-  else
-    warn "Auth URL not found in tailscale login output."
-    warn "If the server is already authorized, it's OK. Otherwise run manually:"
-    warn "  tailscale login"
-  fi
-
-  # Wait until authorization is actually detected
-  for _i in {1..60}; do
-    if tailscale_is_authorized; then
-      ok "tailscale authorization detected (BackendState=Running)"
-      return 0
-    fi
+    if _is_tty && (( i % 5 == 0 )); then info "Waiting Tailscale… state=${st}, ip4=${ip:-"-"} (${i}/${max})"; fi
     sleep 1
   done
-
-  warn "tailscale still not authorized (BackendState=$(tailscale_backend_state:-?))"
   return 1
 }
 
-tailscale_up_ssh_quiet() {
-  # Bring up with ssh enabled; errors are validated by later "wait for Running + IPv4"
-  tailscale up --ssh >>"$TS_LOG" 2>&1 || true
-}
+tailscale_up_ssh_quiet() { tailscale up --ssh >>"$TS_LOG" 2>&1 || true; }
 
 tailscale_apply() {
   hdr "🧠 Tailscale (early)"
@@ -837,75 +735,87 @@ tailscale_apply() {
   tailscale_restart_daemon
   tailscale_sysctl_tune
 
-  # If interface exists but is broken -> reinstall first (purge+install.sh)
   tailscale_reinstall_if_broken
 
-  # If already up and has IPv4 and is authorized -> OK
-  if tailscale_is_up && tailscale_iface_has_ipv4 && tailscale_is_authorized; then
-    local ip name
-    ip="$(tailscale_ip4)"
-    [[ -n "$ip" ]] && ok "tailscale is up (ip ${ip})" || ok "tailscale is up"
-    name="$(tailscale_magicdns_name)"
+  local st ip url
+  st="$(tailscale_backend_state)"
+  ip="$(tailscale_ip4)"
+
+  if [[ "$st" == "Running" ]] && [[ -n "${ip:-}" ]] && tailscale_iface_has_ipv4; then
+    ok "tailscale is up (ip ${ip})"
+    local name; name="$(tailscale_magicdns_name)"
     [[ -n "$name" ]] && ok "MagicDNS: ${name}" || warn "MagicDNS name not available (maybe disabled)."
     TAILSCALE_READY="1"
     return 0
   fi
 
-  # Not authorized -> print auth URL + wait; if already authorized, it will no-op
-  tailscale_print_auth_url_and_wait || true
-
-  # Bring it up with ssh enabled
-  tailscale_up_ssh_quiet
-
-  # Wait for IPv4 on tailscale0 AND BackendState=Running
-  local ip=""
-  for _i in {1..60}; do
-    ip="$(tailscale_ip4)"
-    if [[ -n "$ip" ]] && tailscale_iface_has_ipv4 && tailscale_is_authorized; then
-      break
+  if [[ "$st" == "NeedsLogin" ]]; then
+    url="$(tailscale_auth_url_json)"
+    if [[ -n "${url:-}" ]]; then
+      echo; echo "🔗 Authenticate Tailscale in browser:"; echo "   $url"; echo
+    else
+      warn "Tailscale needs login but AuthURL is empty -> running 'tailscale login --qr'"
+      tailscale_login_qr_emit
+      url="$(tailscale_auth_url_json)"
+      if [[ -n "${url:-}" ]]; then
+        echo; echo "🔗 Authenticate Tailscale in browser:"; echo "   $url"; echo
+      fi
     fi
-    sleep 1
-  done
 
-  if [[ -n "$ip" ]] && tailscale_iface_has_ipv4 && tailscale_is_authorized; then
-    ok "tailscale is up (ip ${ip})"
-    local name
-    name="$(tailscale_magicdns_name)"
-    [[ -n "$name" ]] && ok "MagicDNS: ${name}" || warn "MagicDNS name not available (maybe disabled)."
-    TAILSCALE_READY="1"
-    return 0
-  fi
-
-  # last remediation: restart once and retry login/up
-  warn "tailscale not ready yet (no IPv4 or not authorized) -> restarting tailscaled and retrying"
-  tailscale_restart_daemon
-  tailscale_print_auth_url_and_wait || true
-  tailscale_up_ssh_quiet
-
-  for _i in {1..30}; do
-    ip="$(tailscale_ip4)"
-    if [[ -n "$ip" ]] && tailscale_iface_has_ipv4 && tailscale_is_authorized; then
-      break
+    if _has_dev_tty; then
+      read_tty _ "Press Enter AFTER you approve the device in Tailscale admin (or press Enter now, I'll keep waiting)… "
+    else
+      warn "No /dev/tty available. Will wait for approval automatically."
     fi
-    sleep 1
-  done
-
-  if [[ -n "$ip" ]] && tailscale_iface_has_ipv4 && tailscale_is_authorized; then
-    ok "tailscale is up (ip ${ip})"
-    local name
-    name="$(tailscale_magicdns_name)"
-    [[ -n "$name" ]] && ok "MagicDNS: ${name}" || warn "MagicDNS name not available (maybe disabled)."
-    TAILSCALE_READY="1"
   else
-    warn "tailscale still not ready: ipv4=$(tailscale_ip4:-none), BackendState=$(tailscale_backend_state:-?)"
-    warn "This is unsafe to proceed with UFW (can lock you out). We'll skip enabling UFW."
-    TAILSCALE_READY="0"
+    warn "Tailscale state=${st} -> trying 'tailscale up --ssh'"
   fi
+
+  tailscale_up_ssh_quiet
+
+  if ip="$(tailscale_wait_running_and_ipv4 240)"; then
+    ok "tailscale is up (ip ${ip})"
+    local name; name="$(tailscale_magicdns_name)"
+    [[ -n "$name" ]] && ok "MagicDNS: ${name}" || warn "MagicDNS name not available (maybe disabled)."
+    TAILSCALE_READY="1"
+    return 0
+  fi
+
+  warn "tailscale did not become Ready (Running+IPv4) in time."
+  warn "This is unsafe to proceed with UFW (can lock you out). We'll skip enabling UFW."
+  TAILSCALE_READY="0"
+  return 0
+}
+
+###############################################################################
+# Node Exporter (via external installer)
+###############################################################################
+node_exporter_apply() {
+  hdr "📈 Node Exporter"
+  : >"$NODE_EXPORTER_LOG" 2>/dev/null || true
+
+  # "Фоном": запускаем без ожидания интерактива и пишем лог.
+  # Внутри установщика может быть systemd enable/start — это ок.
+  (
+    set +e
+    echo "[$(date -Is)] start: ${NODE_EXPORTER_INSTALL_CMD}"
+    # shellcheck disable=SC2090
+    bash -c "${NODE_EXPORTER_INSTALL_CMD}"
+    rc=$?
+    echo "[$(date -Is)] done: rc=${rc}"
+    exit $rc
+  ) >>"$NODE_EXPORTER_LOG" 2>&1 &
+
+  disown >/dev/null 2>&1 || true
+  ok "Node Exporter install kicked off (log: $NODE_EXPORTER_LOG)"
 }
 
 ###############################################################################
 # User management
 ###############################################################################
+USER_CREATED="0"
+USER_PASS=""
+
 create_or_ensure_user() {
   local uname="$1"
   [[ -n "$uname" ]] || return 0
@@ -942,7 +852,6 @@ EOF
 zsh_disable_update_prompts() {
   local zrc="$1"
   [[ -f "$zrc" ]] || return 0
-
   grep -q 'DISABLE_AUTO_UPDATE' "$zrc" 2>/dev/null || echo 'DISABLE_AUTO_UPDATE="true"' >> "$zrc"
   grep -q 'DISABLE_UPDATE_PROMPT' "$zrc" 2>/dev/null || echo 'DISABLE_UPDATE_PROMPT=true' >> "$zrc"
   grep -q ":omz:update" "$zrc" 2>/dev/null || echo "zstyle ':omz:update' mode disabled" >> "$zrc"
@@ -951,7 +860,6 @@ zsh_disable_update_prompts() {
 ensure_ohmyzsh_for_user() {
   local uname="$1"
   local home="$2"
-
   [[ -d "$home" ]] || return 0
 
   grep -q '^/usr/bin/zsh$' /etc/shells 2>/dev/null || echo '/usr/bin/zsh' >> /etc/shells
@@ -1041,8 +949,7 @@ zsh_apply_all_users() {
   while IFS= read -r -d '' d; do homes+=("$d"); done < <(find /home -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null || true)
 
   for h in "${homes[@]:-}"; do
-    local u
-    u="$(basename "$h")"
+    local u; u="$(basename "$h")"
     ensure_ohmyzsh_for_user "$u" "$h"
     ok "zsh stack ensured for $u"
   done
@@ -1073,8 +980,6 @@ ssh_harden_apply() {
 
 ###############################################################################
 # UFW firewall
-# CRITICAL: if tailscale requested but not ready (no IPv4), DO NOT enable UFW
-# (prevents lock-out)
 ###############################################################################
 ufw_apply() {
   hdr "🧱 Firewall (UFW)"
@@ -1093,7 +998,6 @@ ufw_apply() {
     fi
   fi
 
-  # If tailscale is enabled, require it to be READY before enabling ufw
   if [[ "${ARG_TAILSCALE}" == "1" ]]; then
     if [[ "${TAILSCALE_READY:-0}" != "1" ]]; then
       warn "tailscale enabled but not ready -> skipping UFW enable to avoid lockout."
@@ -1118,7 +1022,6 @@ ufw_apply() {
     warn "WAN (${internet_iface}): no inbound ports opened (open-wan-443=0)"
   fi
 
-  # Tailscale: allow all (mandatory when enabled)
   if ip link show tailscale0 >/dev/null 2>&1; then
     ufw allow in on tailscale0 >/dev/null 2>&1 || true
     ufw allow out on tailscale0 >/dev/null 2>&1 || true
@@ -1127,7 +1030,6 @@ ufw_apply() {
     warn "tailscale0 not found (tailscale disabled or not up yet)."
   fi
 
-  # Docker bridges
   local docker_ifaces=""
   docker_ifaces="$(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^(docker0|br-)/ {print $2}' || true)"
   if [[ -n "$docker_ifaces" ]]; then
@@ -1167,8 +1069,6 @@ EOF
 
 ###############################################################################
 # remnanode (compose create only if missing)
-# - if remnanode=1: always ask interactively for NODE_PORT/SECRET_KEY when compose missing,
-#   even when piped, via /dev/tty.
 ###############################################################################
 remnanode_collect_inputs_early() {
   local compose="/opt/remnanode/docker-compose.yml"
@@ -1201,7 +1101,6 @@ remnanode_collect_inputs_early() {
 }
 
 remnanode_logrotate_apply() {
-  # Your requested snippet: /var/log/remnanode/*.log rotate by size
   mkdir -p /etc/logrotate.d
   backup_file /etc/logrotate.d/remnanode
   cat > /etc/logrotate.d/remnanode <<'EOF'
@@ -1214,8 +1113,6 @@ remnanode_logrotate_apply() {
   copytruncate
 }
 EOF
-
-  # Best-effort: force run once to validate config
   if command -v logrotate >/dev/null 2>&1; then
     logrotate -vf /etc/logrotate.d/remnanode >>"$ERR_LOG" 2>&1 || true
   fi
@@ -1260,14 +1157,12 @@ EOF
     ok "remnanode compose exists: ${compose}"
   fi
 
-  # Start
   if (cd "$dir" && docker compose up -d) >>"$ERR_LOG" 2>&1; then
     ok "remnanode started"
   else
     warn "remnanode start failed (see $ERR_LOG)"
   fi
 
-  # logrotate for /var/log/remnanode/*.log (requested)
   remnanode_logrotate_apply
 }
 
@@ -1278,398 +1173,269 @@ remnanode_status_line() {
 }
 
 ###############################################################################
-# Kernel + system tuning (tiered; reversible)
+# Kernel/system tuning (tiered; reversible)
 ###############################################################################
-tuning_apply() {
-  hdr "🧠 Kernel + system tuning"
+HW_CPU="?"
+HW_RAM_MB="?"
+HW_TIER="?"
+HW_PROFILE="?"
+HW_DISK_MB="?"
+J_SYSTEM="100M"
+J_RUNTIME="50M"
+LR_ROTATE="7"
 
-  local mem_kb mem_mb cpu
-  mem_kb="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)"
-  mem_mb="$((mem_kb / 1024))"
-  cpu="$(nproc)"
+detect_hw_profile() {
+  HW_CPU="$(nproc 2>/dev/null || echo 1)"
+  HW_RAM_MB="$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 1024)"
+  local ram_gib; ram_gib="$(ceil_gib "$HW_RAM_MB")"
+  HW_TIER="$(ceil_to_tier "$ram_gib")"
+  HW_PROFILE="$(profile_from_tier "$HW_TIER")"
+  HW_DISK_MB="$(disk_size_mb_for_logs)"
+  pick_log_caps "$HW_DISK_MB"
+}
 
-  local disk_mb
-  disk_mb="$(disk_size_mb_for_logs)"
+apply_sysctl_file() {
+  local f="/etc/sysctl.d/99-edge.conf"
+  backup_file "$f"
 
-  local gib ram_tier cpu_tier tier profile
-  gib="$(ceil_gib "$mem_mb")"
-  ram_tier="$(ceil_to_tier "$gib")"
-  cpu_tier="$(ceil_to_tier "$cpu")"
-  tier="$(tier_max "$ram_tier" "$cpu_tier")"
-  profile="$(profile_from_tier "$tier")"
+  local ct_soft; ct_soft="$(ct_soft_from_ram_cpu "$HW_RAM_MB" "$HW_CPU")"
+  local ct_max; ct_max="$(clamp "$ct_soft" 65536 1048576)"
+  local ct_buckets; ct_buckets="$(clamp $(( ct_max / 4 )) 16384 262144)"
 
-  if [[ "${FORCE_PROFILE:-}" =~ ^(low|mid|high|xhigh|2xhigh|dedicated|dedicated\+)$ ]]; then
-    profile="${FORCE_PROFILE}"
+  # tcp_max_tw_buckets: keep moderate to avoid memory blow-ups
+  local tw_buckets
+  if [[ "$HW_TIER" -le 2 ]]; then tw_buckets="200000"
+  elif [[ "$HW_TIER" -le 8 ]]; then tw_buckets="500000"
+  else tw_buckets="1000000"
   fi
 
-  pick_log_caps "$disk_mb"
-  local j_system="$J_SYSTEM" j_runtime="$J_RUNTIME" logrotate_rotate="$LR_ROTATE"
+  # netdev backlog / somaxconn scaling
+  local netdev_backlog somaxconn
+  if [[ "$HW_TIER" -le 2 ]]; then netdev_backlog="16384"; somaxconn="8192"
+  elif [[ "$HW_TIER" -le 8 ]]; then netdev_backlog="32768"; somaxconn="16384"
+  else netdev_backlog="65536"; somaxconn="32768"
+  fi
 
-  local somaxconn netdev_backlog syn_backlog rmem_max wmem_max rmem_def wmem_def tcp_rmem tcp_wmem
-  local swappiness nofile_profile tw_profile
-  local ct_min ct_cap
+  cat >"$f" <<EOF
+# Managed by vps-edge-run.sh
+# Profile: ${HW_PROFILE} (tier=${HW_TIER}), CPU=${HW_CPU}, RAM=${HW_RAM_MB}MiB
 
-  case "$profile" in
-    low)
-      somaxconn=4096;  netdev_backlog=16384;  syn_backlog=4096
-      rmem_max=$((32*1024*1024));  wmem_max=$((32*1024*1024))
-      rmem_def=$((8*1024*1024));   wmem_def=$((8*1024*1024))
-      tcp_rmem="4096 262144 ${rmem_max}"
-      tcp_wmem="4096 262144 ${wmem_max}"
-      swappiness=5
-      nofile_profile=65536
-      tw_profile=50000
-      ct_min=32768;   ct_cap=65536
-      ;;
-    mid)
-      somaxconn=16384; netdev_backlog=65536;  syn_backlog=16384
-      rmem_max=$((64*1024*1024));  wmem_max=$((64*1024*1024))
-      rmem_def=$((16*1024*1024));  wmem_def=$((16*1024*1024))
-      tcp_rmem="4096 87380 ${rmem_max}"
-      tcp_wmem="4096 65536 ${wmem_max}"
-      swappiness=10
-      nofile_profile=131072
-      tw_profile=90000
-      ct_min=65536;   ct_cap=131072
-      ;;
-    high)
-      somaxconn=65535; netdev_backlog=131072; syn_backlog=65535
-      rmem_max=$((128*1024*1024)); wmem_max=$((128*1024*1024))
-      rmem_def=$((32*1024*1024));  wmem_def=$((32*1024*1024))
-      tcp_rmem="4096 87380 ${rmem_max}"
-      tcp_wmem="4096 65536 ${wmem_max}"
-      swappiness=10
-      nofile_profile=262144
-      tw_profile=150000
-      ct_min=131072;  ct_cap=262144
-      ;;
-    xhigh)
-      somaxconn=65535; netdev_backlog=250000; syn_backlog=65535
-      rmem_max=$((256*1024*1024)); wmem_max=$((256*1024*1024))
-      rmem_def=$((64*1024*1024));  wmem_def=$((64*1024*1024))
-      tcp_rmem="4096 87380 ${rmem_max}"
-      tcp_wmem="4096 65536 ${wmem_max}"
-      swappiness=10
-      nofile_profile=524288
-      tw_profile=250000
-      ct_min=262144;  ct_cap=524288
-      ;;
-    2xhigh)
-      somaxconn=65535; netdev_backlog=350000; syn_backlog=65535
-      rmem_max=$((384*1024*1024)); wmem_max=$((384*1024*1024))
-      rmem_def=$((96*1024*1024));  wmem_def=$((96*1024*1024))
-      tcp_rmem="4096 87380 ${rmem_max}"
-      tcp_wmem="4096 65536 ${wmem_max}"
-      swappiness=10
-      nofile_profile=1048576
-      tw_profile=350000
-      ct_min=524288;  ct_cap=1048576
-      ;;
-    dedicated)
-      somaxconn=65535; netdev_backlog=500000; syn_backlog=65535
-      rmem_max=$((512*1024*1024)); wmem_max=$((512*1024*1024))
-      rmem_def=$((128*1024*1024)); wmem_def=$((128*1024*1024))
-      tcp_rmem="4096 87380 ${rmem_max}"
-      tcp_wmem="4096 65536 ${wmem_max}"
-      swappiness=10
-      nofile_profile=2097152
-      tw_profile=600000
-      ct_min=1048576; ct_cap=2097152
-      ;;
-    dedicated+)
-      somaxconn=65535; netdev_backlog=700000; syn_backlog=65535
-      rmem_max=$((768*1024*1024)); wmem_max=$((768*1024*1024))
-      rmem_def=$((192*1024*1024)); wmem_def=$((192*1024*1024))
-      tcp_rmem="4096 87380 ${rmem_max}"
-      tcp_wmem="4096 65536 ${wmem_max}"
-      swappiness=10
-      nofile_profile=4194304
-      tw_profile=900000
-      ct_min=2097152; ct_cap=4194304
-      ;;
-  esac
+# Routing / forwarding
+net.ipv4.ip_forward=1
 
-  local current_ct current_tw current_nofile
-  current_ct="$(to_int "$B_CT_MAX")"
-  current_tw="$(to_int "$B_TW")"
-  current_nofile="$(to_int "$B_NOFILE")"
+# Queueing + congestion control
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
 
-  local nofile_final tw_final
-  nofile_final="$(imax "$current_nofile" "$nofile_profile")"
-  tw_final="$(imax "$current_tw" "$tw_profile")"
+# Conntrack sizing (NAT / stateful firewall)
+net.netfilter.nf_conntrack_max=${ct_max}
+net.netfilter.nf_conntrack_buckets=${ct_buckets}
 
-  local ct_soft ct_clamped ct_final
-  ct_soft="$(ct_soft_from_ram_cpu "$mem_mb" "$cpu")"
-  ct_clamped="$(clamp "$ct_soft" "$ct_min" "$ct_cap")"
-  ct_final="$(imax "$current_ct" "$ct_clamped")"
-  local ct_buckets=$((ct_final/4)); [[ "$ct_buckets" -lt 4096 ]] && ct_buckets=4096
+# Conntrack timeouts (reduce long-lived dead entries; keep sane defaults)
+net.netfilter.nf_conntrack_tcp_timeout_established=7200
+net.netfilter.nf_conntrack_tcp_timeout_close_wait=60
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait=60
+net.netfilter.nf_conntrack_tcp_timeout_time_wait=60
 
+# TCP hardening + keepalives
+net.ipv4.tcp_syncookies=1
+net.ipv4.tcp_rfc1337=1
+net.ipv4.tcp_keepalive_time=60
+net.ipv4.tcp_keepalive_intvl=10
+net.ipv4.tcp_keepalive_probes=6
+
+# Sockets/backlog
+net.core.somaxconn=${somaxconn}
+net.core.netdev_max_backlog=${netdev_backlog}
+net.ipv4.tcp_max_syn_backlog=8192
+net.ipv4.ip_local_port_range=10240 60999
+
+# TIME-WAIT bucket cap
+net.ipv4.tcp_max_tw_buckets=${tw_buckets}
+
+# Memory / swapping
+vm.swappiness=10
+EOF
+
+  sysctl --system >>"$ERR_LOG" 2>&1 || true
+  ok "sysctl tuning applied: $f"
+}
+
+ensure_swapfile() {
+  hdr "💾 Swap"
+  # if any swap already exists -> don't touch
+  if /sbin/swapon --noheadings --show=NAME 2>/dev/null | grep -q .; then
+    ok "swap already enabled: $(_swap_state)"
+    return 0
+  fi
+
+  # Decide swap size:
+  # - <=2GiB RAM: swap = RAM
+  # - 4..8GiB: swap = 2GiB
+  # - >=16GiB: swap = 4GiB
+  local ram_gib swap_gib
+  ram_gib="$(ceil_gib "$HW_RAM_MB")"
+  if [[ "$ram_gib" -le 2 ]]; then
+    swap_gib="$ram_gib"
+  elif [[ "$ram_gib" -le 8 ]]; then
+    swap_gib="2"
+  else
+    swap_gib="4"
+  fi
+  [[ "$swap_gib" -lt 1 ]] && swap_gib="1"
+
+  local sf="/swapfile"
   backup_file /etc/fstab
-  local swap_gb=2
-  if   [[ "$mem_mb" -lt 2048  ]]; then swap_gb=1
-  elif [[ "$mem_mb" -lt 4096  ]]; then swap_gb=2
-  elif [[ "$mem_mb" -lt 8192  ]]; then swap_gb=4
-  elif [[ "$mem_mb" -lt 16384 ]]; then swap_gb=6
-  else swap_gb=8
+
+  if [[ -f "$sf" ]]; then
+    warn "/swapfile already exists but swap not enabled; will try to (re)enable it."
+  else
+    info "Creating swapfile: ${swap_gib}G at ${sf}"
+    if command -v fallocate >/dev/null 2>&1; then
+      fallocate -l "${swap_gib}G" "$sf" >>"$ERR_LOG" 2>&1 || true
+    fi
+    if [[ ! -s "$sf" ]]; then
+      dd if=/dev/zero of="$sf" bs=1M count=$((swap_gib*1024)) status=none >>"$ERR_LOG" 2>&1 || true
+    fi
+    chmod 600 "$sf" >>"$ERR_LOG" 2>&1 || true
+    mkswap "$sf" >>"$ERR_LOG" 2>&1 || true
   fi
 
-  local swap_target_mb=$((swap_gb * 1024))
-  local swap_total_mb; swap_total_mb="$(awk '/SwapTotal:/ {print int($2/1024)}' /proc/meminfo)"
-  local has_swap_partition="0"
-  if /sbin/swapon --show=TYPE 2>/dev/null | grep -q '^partition$'; then
-    has_swap_partition="1"
+  swapon "$sf" >>"$ERR_LOG" 2>&1 || true
+
+  if ! grep -qE '^[^#].*\s/swapfile\s+swap\s' /etc/fstab 2>/dev/null; then
+    echo "/swapfile none swap sw 0 0" >> /etc/fstab
   fi
 
-  if [[ "$has_swap_partition" == "0" ]]; then
-    local active_swapfile="0"
-    if /sbin/swapon --show=NAME 2>/dev/null | grep -qx '/swapfile'; then
-      active_swapfile="1"
-    fi
-
-    local need_swapfile="0"
-    if [[ "$swap_total_mb" -eq 0 ]]; then
-      need_swapfile="1"
-    elif [[ "$active_swapfile" == "1" ]]; then
-      local diff=$(( swap_total_mb > swap_target_mb ? swap_total_mb - swap_target_mb : swap_target_mb - swap_total_mb ))
-      [[ "$diff" -ge 256 ]] && need_swapfile="1"
-    elif [[ -f /swapfile ]]; then
-      need_swapfile="1"
-    fi
-
-    if [[ "$need_swapfile" == "1" ]]; then
-      /sbin/swapoff /swapfile 2>/dev/null || true
-      rm -f /swapfile
-      if command -v fallocate >/dev/null 2>&1; then
-        fallocate -l "${swap_gb}G" /swapfile
-      else
-        dd if=/dev/zero of=/swapfile bs=1M count="$swap_target_mb" status=none
-      fi
-      chmod 600 /swapfile
-      mkswap /swapfile >/dev/null
-      /sbin/swapon /swapfile
-      if ! grep -qE '^\s*/swapfile\s+none\s+swap\s' /etc/fstab; then
-        echo '/swapfile none swap sw 0 0' >> /etc/fstab
-      fi
-    fi
+  if /sbin/swapon --noheadings --show=NAME 2>/dev/null | grep -q /swapfile; then
+    ok "swap enabled: $(_swap_state)"
+  else
+    warn "swap not enabled (see $ERR_LOG)."
   fi
+}
 
-  backup_file /etc/sysctl.conf
-  shopt -s nullglob
-  for f in /etc/sysctl.d/*.conf; do
-    [[ -f "$f" ]] || continue
-    case "$f" in
-      /etc/sysctl.d/90-edge-network.conf|/etc/sysctl.d/92-edge-safe.conf|/etc/sysctl.d/95-edge-forward.conf|/etc/sysctl.d/96-edge-vm.conf|/etc/sysctl.d/99-edge-conntrack.conf|/etc/sysctl.d/95-edge-tailscale.conf) continue ;;
-    esac
-    if grep -Eq 'nf_conntrack_|tcp_congestion_control|default_qdisc|ip_forward|somaxconn|netdev_max_backlog|tcp_rmem|tcp_wmem|rmem_max|wmem_max|vm\.swappiness|vfs_cache_pressure|tcp_syncookies|tcp_max_tw_buckets|tcp_keepalive|tcp_mtu_probing|tcp_fin_timeout|tcp_tw_reuse|tcp_slow_start_after_idle|tcp_rfc1337' "$f"; then
-      move_aside "$f"
-    fi
-  done
-  shopt -u nullglob
+apply_nofile_limits() {
+  hdr "📂 nofile limits"
+  local sysd="/etc/systemd/system.conf.d/90-edge-nofile.conf"
+  local lim="/etc/security/limits.d/90-edge.conf"
 
-  if [[ -f /etc/sysctl.conf ]]; then
-    sed -i -E \
-      's/^\s*(net\.netfilter\.nf_conntrack_|net\.ipv4\.tcp_congestion_control|net\.core\.default_qdisc|net\.ipv4\.ip_forward|net\.core\.somaxconn|net\.core\.netdev_max_backlog|net\.ipv4\.tcp_(rmem|wmem)|net\.core\.(rmem|wmem)_(max|default)|vm\.swappiness|vm\.vfs_cache_pressure|net\.ipv4\.tcp_syncookies|net\.ipv4\.tcp_max_tw_buckets|net\.ipv4\.tcp_(keepalive_time|keepalive_intvl|keepalive_probes)|net\.ipv4\.tcp_rfc1337)/# \0/' \
-      /etc/sysctl.conf || true
-  fi
+  mkdir -p /etc/systemd/system.conf.d /etc/security/limits.d
 
-  modprobe nf_conntrack >/dev/null 2>&1 || true
-  mkdir -p /etc/modules-load.d
-  backup_file /etc/modules-load.d/edge-conntrack.conf
-  echo nf_conntrack > /etc/modules-load.d/edge-conntrack.conf
+  backup_file "$sysd"
+  backup_file "$lim"
+  backup_file /etc/pam.d/common-session
+  backup_file /etc/pam.d/common-session-noninteractive
 
-  cat > /etc/sysctl.d/90-edge-network.conf <<EOM
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.core.somaxconn = ${somaxconn}
-net.core.netdev_max_backlog = ${netdev_backlog}
-net.ipv4.tcp_max_syn_backlog = ${syn_backlog}
-net.core.rmem_max = ${rmem_max}
-net.core.wmem_max = ${wmem_max}
-net.core.rmem_default = ${rmem_def}
-net.core.wmem_default = ${wmem_def}
-net.ipv4.tcp_rmem = ${tcp_rmem}
-net.ipv4.tcp_wmem = ${tcp_wmem}
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_fin_timeout = 10
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.udp_rmem_min = 8192
-net.ipv4.udp_wmem_min = 8192
-EOM
-
-  echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/95-edge-forward.conf
-
-  cat > /etc/sysctl.d/96-edge-vm.conf <<EOM
-vm.swappiness = ${swappiness}
-vm.vfs_cache_pressure = 50
-EOM
-
-  cat > /etc/sysctl.d/99-edge-conntrack.conf <<EOM
-net.netfilter.nf_conntrack_max = ${ct_final}
-net.netfilter.nf_conntrack_buckets = ${ct_buckets}
-net.netfilter.nf_conntrack_tcp_timeout_established = 900
-net.netfilter.nf_conntrack_tcp_timeout_time_wait = 15
-net.netfilter.nf_conntrack_udp_timeout = 30
-net.netfilter.nf_conntrack_udp_timeout_stream = 60
-EOM
-
-  cat > /etc/sysctl.d/92-edge-safe.conf <<EOM
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_max_tw_buckets = ${tw_final}
-net.ipv4.tcp_rfc1337 = 1
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 30
-net.ipv4.tcp_keepalive_probes = 5
-EOM
-
-  sysctl --system >/dev/null 2>&1 || true
-
-  mkdir -p /etc/systemd/system.conf.d
-  shopt -s nullglob
-  for f in /etc/systemd/system.conf.d/*.conf; do
-    [[ "$f" == "/etc/systemd/system.conf.d/90-edge.conf" ]] && continue
-    grep -qE '^\s*DefaultLimitNOFILE\s*=' "$f" && move_aside "$f"
-  done
-  shopt -u nullglob
-
-  cat > /etc/systemd/system.conf.d/90-edge.conf <<EOM
+  cat >"$sysd" <<'EOF'
+# Managed by vps-edge-run.sh
 [Manager]
-DefaultLimitNOFILE=${nofile_final}
-EOM
+DefaultLimitNOFILE=1048576
+EOF
 
-  mkdir -p /etc/security/limits.d
-  shopt -s nullglob
-  for f in /etc/security/limits.d/*.conf; do
-    [[ "$f" == "/etc/security/limits.d/90-edge.conf" ]] && continue
-    grep -qE '^\s*[*a-zA-Z0-9._-]+\s+(soft|hard)\s+nofile\s+' "$f" && move_aside "$f"
-  done
-  shopt -u nullglob
+  cat >"$lim" <<'EOF'
+# Managed by vps-edge-run.sh
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+EOF
 
-  cat > /etc/security/limits.d/90-edge.conf <<EOM
-* soft nofile ${nofile_final}
-* hard nofile ${nofile_final}
-root soft nofile ${nofile_final}
-root hard nofile ${nofile_final}
-EOM
+  # Ensure pam_limits is included (Ubuntu/Debian)
+  if [[ -f /etc/pam.d/common-session ]] && ! grep -qE '^\s*session\s+required\s+pam_limits\.so' /etc/pam.d/common-session; then
+    echo "session required pam_limits.so" >> /etc/pam.d/common-session
+  fi
+  if [[ -f /etc/pam.d/common-session-noninteractive ]] && ! grep -qE '^\s*session\s+required\s+pam_limits\.so' /etc/pam.d/common-session-noninteractive; then
+    echo "session required pam_limits.so" >> /etc/pam.d/common-session-noninteractive
+  fi
 
-  systemctl daemon-reexec >/dev/null 2>&1 || true
+  systemctl daemon-reexec >>"$ERR_LOG" 2>&1 || true
+  ok "nofile set to 1048576 (systemd + pam)"
+}
 
+apply_journald_limits() {
+  hdr "🪵 journald limits"
   mkdir -p /etc/systemd/journald.conf.d
-  shopt -s nullglob
-  for f in /etc/systemd/journald.conf.d/*.conf; do
-    [[ "$f" == "/etc/systemd/journald.conf.d/90-edge.conf" ]] && continue
-    move_aside "$f"
-  done
-  shopt -u nullglob
+  local f="/etc/systemd/journald.conf.d/90-edge.conf"
+  backup_file "$f"
 
-  cat > /etc/systemd/journald.conf.d/90-edge.conf <<EOM
+  cat >"$f" <<EOF
+# Managed by vps-edge-run.sh (disk-aware)
 [Journal]
+SystemMaxUse=${J_SYSTEM}
+RuntimeMaxUse=${J_RUNTIME}
 Compress=yes
-SystemMaxUse=${j_system}
-RuntimeMaxUse=${j_runtime}
 RateLimitIntervalSec=30s
-RateLimitBurst=1000
-EOM
-  systemctl restart systemd-journald >/dev/null 2>&1 || true
+RateLimitBurst=10000
+EOF
 
-  mkdir -p /etc/apt/apt.conf.d
-  backup_file /etc/apt/apt.conf.d/99-edge-unattended.conf
-  cat > /etc/apt/apt.conf.d/99-edge-unattended.conf <<'EOM'
+  systemctl restart systemd-journald >>"$ERR_LOG" 2>&1 || true
+  ok "journald caps applied: SystemMaxUse=${J_SYSTEM}, RuntimeMaxUse=${J_RUNTIME}"
+}
+
+apply_unattended_upgrades_policy() {
+  hdr "🔁 unattended-upgrades"
+  local f="/etc/apt/apt.conf.d/52unattended-upgrades-edge"
+  backup_file "$f"
+  cat >"$f" <<'EOF'
+/* Managed by vps-edge-run.sh */
 Unattended-Upgrade::Automatic-Reboot "false";
 Unattended-Upgrade::Automatic-Reboot-Time "04:00";
-EOM
+EOF
+  ok "Auto-reboot disabled for unattended-upgrades"
+}
 
-  backup_file /etc/logrotate.conf
-  cat > /etc/logrotate.conf <<EOM
-daily
-rotate ${logrotate_rotate}
-compress
-delaycompress
-missingok
-notifempty
-create
-su root adm
-include /etc/logrotate.d
-EOM
-
-  mkdir -p /etc/logrotate.d
-  backup_file /etc/logrotate.d/edge-all-text-logs
-  cat > /etc/logrotate.d/edge-all-text-logs <<EOM
-/var/log/syslog
-/var/log/kern.log
-/var/log/auth.log
-/var/log/daemon.log
-/var/log/user.log
-/var/log/messages
-/var/log/dpkg.log
-/var/log/apt/history.log
-/var/log/apt/term.log
-/var/log/*.log
-/var/log/*/*.log
-/var/log/*/*/*.log
-/var/log/*.out
-/var/log/*/*.out
-/var/log/*.err
-/var/log/*/*.err
-{
+apply_logrotate_varlog() {
+  hdr "🗂️ logrotate (var/log)"
+  local f="/etc/logrotate.d/zz-edge-varlog"
+  backup_file "$f"
+  cat >"$f" <<EOF
+# Managed by vps-edge-run.sh
+/var/log/*.log /var/log/syslog /var/log/auth.log /var/log/kern.log /var/log/daemon.log /var/log/messages {
   daily
-  rotate ${logrotate_rotate}
-  compress
-  delaycompress
+  rotate ${LR_ROTATE}
   missingok
   notifempty
+  compress
+  delaycompress
   copytruncate
-  sharedscripts
-  postrotate
-    systemctl kill -s HUP rsyslog.service >/dev/null 2>&1 || true
-  endscript
 }
-EOM
+EOF
+  if command -v logrotate >/dev/null 2>&1; then
+    logrotate -vf "$f" >>"$ERR_LOG" 2>&1 || true
+  fi
+  ok "logrotate rule installed: $f (rotate=${LR_ROTATE})"
+}
 
-  mkdir -p /etc/tmpfiles.d
-  backup_file /etc/tmpfiles.d/edge-tmp.conf
-  cat > /etc/tmpfiles.d/edge-tmp.conf <<'EOM'
-D /tmp            1777 root root 7d
-D /var/tmp        1777 root root 14d
-EOM
-  systemd-tmpfiles --create >/dev/null 2>&1 || true
+tuning_apply() {
+  hdr "🛠️ System tuning"
 
-  HW_PROFILE="$profile"
-  HW_TIER="$tier"
-  HW_CPU="$cpu"
-  HW_RAM_MB="$mem_mb"
-  HW_DISK_MB="$(disk_root_mb)"
+  detect_hw_profile
+  info "HW profile: profile=${HW_PROFILE}, tier=${HW_TIER} | CPU=${HW_CPU} | RAM=${HW_RAM_MB}MiB | disk(/var/log)=${HW_DISK_MB}MB"
 
-  ok "tuning applied (profile ${profile}, tier ${tier})"
+  apply_sysctl_file
+  ensure_swapfile
+  apply_nofile_limits
+  apply_journald_limits
+  apply_unattended_upgrades_policy
+  apply_logrotate_varlog
 }
 
 ###############################################################################
-# Summary header: provider/geo
+# Start/end banner
 ###############################################################################
 print_start_end_banner() {
   local title="$1"
-  local ip cc country region city org flag
-  ip="$(ext_ip)"
-  [[ -n "$ip" ]] || ip="?"
-  local gl
-  gl="$(geo_lookup "$ip")"
+  local ip cc region city org flag
+  ip="$(ext_ip)"; [[ -n "$ip" ]] || ip="?"
+  local gl; gl="$(geo_lookup "$ip")"
   cc="${gl%%|*}"
-  country="$(echo "$gl" | cut -d'|' -f2)"
   region="$(echo "$gl" | cut -d'|' -f3)"
   city="$(echo "$gl" | cut -d'|' -f4)"
   org="$(echo "$gl" | cut -d'|' -f5)"
-
   flag="$(country_flag "$cc")"
-
   hdr "$title"
   echo "  ${flag} ${ip} — ${city:-?}, ${region:-?}, ${cc:-?} — ${org:-?}"
-  WAN_IP="$ip"
-  GEO_CC="$cc"
-  GEO_CITY="$city"
-  GEO_REGION="$region"
-  GEO_PROVIDER="$org"
-  GEO_FLAG="$flag"
+  WAN_IP="$ip"; GEO_CC="$cc"; GEO_CITY="$city"; GEO_REGION="$region"; GEO_PROVIDER="$org"; GEO_FLAG="$flag"
 }
 
 ###############################################################################
@@ -1731,6 +1497,12 @@ apply_cmd() {
     [[ -z "$a" || "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_TAILSCALE="1" || ARG_TAILSCALE="0"
   fi
 
+  if [[ -z "${ARG_NODE_EXPORTER}" ]]; then
+    local a="y"
+    read_tty a "Install Node Exporter? [Y/n]: "
+    [[ -z "$a" || "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_NODE_EXPORTER="1" || ARG_NODE_EXPORTER="0"
+  fi
+
   if [[ -z "${ARG_REMNANODE}" ]]; then
     local a="n"
     read_tty a "Install/start remnanode? [y/N]: "
@@ -1749,7 +1521,12 @@ apply_cmd() {
     [[ -z "$a" || "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_OPEN_WAN_443="1" || ARG_OPEN_WAN_443="0"
   fi
 
-  # If remnanode requested -> collect inputs early only if compose missing (interactive via /dev/tty)
+  if [[ -z "${ARG_ZSH_ALL_USERS}" ]]; then
+    local a="y"
+    read_tty a "Setup zsh stack for all users? [Y/n]: "
+    [[ -z "$a" || "${a,,}" == "y" || "${a,,}" == "yes" ]] && ARG_ZSH_ALL_USERS="1" || ARG_ZSH_ALL_USERS="0"
+  fi
+
   if [[ "${ARG_REMNANODE}" == "1" ]]; then
     remnanode_collect_inputs_early
   fi
@@ -1766,14 +1543,16 @@ apply_cmd() {
     dns_apply
   fi
 
-  # Tailscale MUST be done before UFW to prevent lockout
   TAILSCALE_READY="0"
   if [[ "${ARG_TAILSCALE}" == "1" ]]; then
     tailscale_apply
-    # If tailscale got IPv4 on tailscale0 -> ready, else we already warned and will skip UFW
     if [[ "${TAILSCALE_READY:-0}" != "1" ]]; then
-      warn "tailscale not ready (no IPv4 or not authorized) -> UFW will be skipped."
+      warn "tailscale not ready (no IPv4) -> UFW will be skipped."
     fi
+  fi
+
+  if [[ "${ARG_NODE_EXPORTER}" == "1" ]]; then
+    node_exporter_apply
   fi
 
   if [[ "${ARG_REMNANODE}" == "1" ]]; then
@@ -1792,7 +1571,11 @@ apply_cmd() {
     USER_PASS=""
   fi
 
-  zsh_apply_all_users
+  if [[ "${ARG_ZSH_ALL_USERS}" == "1" ]]; then
+    zsh_apply_all_users
+  else
+    warn "zsh setup skipped (zsh-all-users=0)"
+  fi
 
   tuning_apply
 
@@ -1800,9 +1583,7 @@ apply_cmd() {
     ssh_harden_apply
   fi
 
-  # Firewall (safe: if tailscale enabled but not ready, ufw_apply will skip)
   ufw_apply
-
   iperf3_server_apply
 
   if [[ "${ARG_REMNANODE}" == "1" ]]; then
@@ -1813,15 +1594,13 @@ apply_cmd() {
   aptq "Autoremove" autoremove --purge
 
   snapshot_after
-
   print_start_end_banner "🏁 End"
 
   print_before_after_all
   print_manifest_compact "$manifest"
 
   local ts_ip ts_name
-  ts_ip=""
-  ts_name=""
+  ts_ip=""; ts_name=""
   if command -v tailscale >/dev/null 2>&1; then
     ts_ip="$(tailscale_ip4)"
     ts_name="$(tailscale_magicdns_name)"
@@ -1837,7 +1616,7 @@ apply_cmd() {
   row_kv "Provider"    "${GEO_PROVIDER:-?}"
   if [[ -n "${ts_ip:-}" ]]; then row_kv "Tailscale IP" "${ts_ip}"; else row_kv "Tailscale IP" "-"; fi
   if [[ -n "${ts_name:-}" ]]; then row_kv "MagicDNS" "${ts_name}"; else row_kv "MagicDNS" "-"; fi
-  row_kv "HW profile"  "profile ${HW_PROFILE:-?}, tier ${HW_TIER:-?} | CPU ${HW_CPU:-?} | RAM ${HW_RAM_MB:-?} MiB | / ${HW_DISK_MB:-?} MB"
+  row_kv "HW profile"  "profile ${HW_PROFILE:-?}, tier ${HW_TIER:-?} | CPU ${HW_CPU:-?} | RAM ${HW_RAM_MB:-?} MiB | /var/log ${HW_DISK_MB:-?} MB"
   if [[ -n "${ARG_USER:-}" ]]; then
     if [[ "${USER_CREATED:-0}" == "1" ]]; then
       row_kv "User"      "${ARG_USER}"
@@ -1857,16 +1636,49 @@ apply_cmd() {
     row_kv "remnanode"  "-"
     row_kv "compose"    "-"
   fi
+  if [[ "${ARG_NODE_EXPORTER}" == "1" ]]; then
+    row_kv "NodeExp log" "$NODE_EXPORTER_LOG"
+  fi
 
   hdr "📚 Backup + logs"
   echo "Backup: ${backup_dir}"
   echo "Logs:"
-  echo "  - 📦 APT:       ${APT_LOG}"
-  echo "  - 🌐 DNS:       ${DNS_LOG}"
-  echo "  - 🧠 Tailscale: ${TS_LOG}"
-  echo "  - 🐳 Docker:    ${DOCKER_LOG}"
-  echo "  - 🛑 Error:     ${ERR_LOG}"
+  echo "  - 📦 APT:          ${APT_LOG}"
+  echo "  - 🌐 DNS:          ${DNS_LOG}"
+  echo "  - 🧠 Tailscale:    ${TS_LOG}"
+  echo "  - 🐳 Docker:       ${DOCKER_LOG}"
+  echo "  - 📈 Node Exporter:${NODE_EXPORTER_LOG}"
+  echo "  - 🛑 Error:        ${ERR_LOG}"
   echo "BACKUP_DIR=${backup_dir}"
+
+  hdr "✅ How to verify"
+  cat <<'EOF'
+1) sysctl + BBR
+   sysctl net.ipv4.ip_forward net.core.default_qdisc net.ipv4.tcp_congestion_control
+   sysctl net.netfilter.nf_conntrack_max net.netfilter.nf_conntrack_buckets
+
+2) swap / nofile
+   swapon --show
+   systemctl show --property DefaultLimitNOFILE
+   ulimit -n
+
+3) journald / logrotate
+   cat /etc/systemd/journald.conf.d/90-edge.conf
+   sudo journalctl --disk-usage
+   sudo logrotate -vf /etc/logrotate.d/zz-edge-varlog
+
+4) tailscale
+   tailscale status
+   ip -4 addr show tailscale0
+
+5) firewall (if enabled)
+   sudo ufw status verbose
+
+6) node exporter (if enabled)
+   # depends on installer, usually:
+   systemctl status node_exporter || systemctl status prometheus-node-exporter
+   ss -lntp | grep -E ':9100\b' || true
+EOF
 
   maybe_reboot
 }
@@ -1885,29 +1697,17 @@ rollback_cmd() {
 
   snapshot_before
 
-  rm -f /etc/sysctl.d/90-edge-network.conf \
-        /etc/sysctl.d/92-edge-safe.conf \
-        /etc/sysctl.d/95-edge-forward.conf \
-        /etc/sysctl.d/96-edge-vm.conf \
-        /etc/sysctl.d/99-edge-conntrack.conf \
+  # Remove our managed drop-ins (they will also be restored if backed up)
+  rm -f /etc/sysctl.d/99-edge.conf \
         /etc/sysctl.d/95-edge-tailscale.conf \
-        /etc/modules-load.d/edge-conntrack.conf \
-        /etc/systemd/system.conf.d/90-edge.conf \
+        /etc/systemd/system.conf.d/90-edge-nofile.conf \
         /etc/security/limits.d/90-edge.conf \
         /etc/systemd/journald.conf.d/90-edge.conf \
-        /etc/apt/apt.conf.d/99-edge-unattended.conf \
-        /etc/logrotate.d/edge-all-text-logs \
-        /etc/logrotate.d/remnanode \
-        /etc/tmpfiles.d/edge-tmp.conf \
+        /etc/apt/apt.conf.d/52unattended-upgrades-edge \
+        /etc/logrotate.d/zz-edge-varlog \
         /etc/systemd/system/iperf3.service 2>/dev/null || true
 
   restore_manifest "$backup"
-
-  if /sbin/swapon --show=NAME 2>/dev/null | grep -qx '/swapfile'; then
-    /sbin/swapoff /swapfile 2>/dev/null || true
-  fi
-  sed -i -E '/^\s*\/swapfile\s+none\s+swap\s+/d' /etc/fstab 2>/dev/null || true
-  rm -f /swapfile 2>/dev/null || true
 
   sysctl --system >/dev/null 2>&1 || true
   systemctl daemon-reexec >/dev/null 2>&1 || true
@@ -1941,16 +1741,10 @@ status_cmd() {
   row_kv "RebootTime" "$(_unattended_time "$B_UNATT")"
 }
 
-###############################################################################
-# Main
-###############################################################################
 case "$CMD" in
   apply)    apply_cmd ;;
   rollback) rollback_cmd "$@" ;;
   status)   status_cmd ;;
   ""|help|-h|--help) usage; exit 0 ;;
-  *)
-    usage
-    exit 1
-    ;;
+  *) usage; exit 1 ;;
 esac
