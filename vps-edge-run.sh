@@ -36,15 +36,104 @@ need_root() {
   die "Not root. Use: curl ... | sudo bash -s -- apply ..."
 }
 
-read_tty() {
-  # Always read from /dev/tty if present (works even when stdin is a pipe)
-  local __var="$1" __prompt="$2" __v=""
-  if [[ -e /dev/tty ]]; then
-    read -rp "$__prompt" __v </dev/tty || true
-  else
-    __v=""
-  fi
-  printf -v "$__var" '%s' "$__v"
+# -------------------------- Args --------------------------
+CMD="${1:-}"; shift || true
+
+ARG_USER=""
+ARG_TIMEZONE="Europe/Moscow"
+ARG_REBOOT="0"
+
+ARG_TAILSCALE="0"
+ARG_DNS_SWITCHER="0"
+ARG_DNS_PROFILE=""        # empty => interactive upstream
+ARG_REMNANODE="0"
+ARG_SSH_HARDEN="0"
+ARG_OPEN_WAN_443="0"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --user=*)          ARG_USER="${1#*=}"; shift ;;
+    --timezone=*)      ARG_TIMEZONE="${1#*=}"; shift ;;
+    --reboot=*)        ARG_REBOOT="${1#*=}"; shift ;;
+    --tailscale=*)     ARG_TAILSCALE="${1#*=}"; shift ;;
+    --dns-switcher=*)  ARG_DNS_SWITCHER="${1#*=}"; shift ;;
+    --dns-profile=*)   ARG_DNS_PROFILE="${1#*=}"; shift ;;
+    --remnanode=*)     ARG_REMNANODE="${1#*=}"; shift ;;
+    --ssh-harden=*)    ARG_SSH_HARDEN="${1#*=}"; shift ;;
+    --open-wan-443=*)  ARG_OPEN_WAN_443="${1#*=}"; shift ;;
+    --user)          ARG_USER="${2:-}"; shift 2 ;;
+    --timezone)      ARG_TIMEZONE="${2:-}"; shift 2 ;;
+    --reboot)        ARG_REBOOT="${2:-}"; shift 2 ;;
+    --tailscale)     ARG_TAILSCALE="${2:-}"; shift 2 ;;
+    --dns-switcher)  ARG_DNS_SWITCHER="${2:-}"; shift 2 ;;
+    --dns-profile)   ARG_DNS_PROFILE="${2:-}"; shift 2 ;;
+    --remnanode)     ARG_REMNANODE="${2:-}"; shift 2 ;;
+    --ssh-harden)    ARG_SSH_HARDEN="${2:-}"; shift 2 ;;
+    --open-wan-443)  ARG_OPEN_WAN_443="${2:-}"; shift 2 ;;
+    *) die "Unknown arg: $1" ;;
+  esac
+done
+
+# -------------------------- URLs (assets) --------------------------
+ASSET_APT="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/apt-bootstrap.sh"
+ASSET_DNS="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/dns-bootstrap.sh"
+ASSET_KERNEL="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/kernel-bootstrap.sh"
+ASSET_TAILSCALE="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/tailscale-bootstrap.sh"
+ASSET_USER="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/user-setup.sh"
+ASSET_ZSH="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/zsh-bootstrap.sh"
+ASSET_UFW="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/ufw-bootstrap.sh"
+ASSET_SSH="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/ssh-bootstrap.sh"
+ASSET_REMNANODE="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/remnanode-bootstrap.sh"
+ASSET_HOSTNAME="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/hostname-bootstrap.sh"
+
+# -------------------------- Logs --------------------------
+LOG_DIR="/var/log"
+L_APT="${LOG_DIR}/vps-edge-apt.log"
+L_DNS="${LOG_DIR}/vps-edge-dns-switcher.log"
+L_TS="${LOG_DIR}/vps-edge-tailscale.log"
+L_USER="${LOG_DIR}/vps-edge-user.log"
+L_ZSH="${LOG_DIR}/vps-edge-zsh.log"
+L_UFW="${LOG_DIR}/vps-edge-ufw.log"
+L_SSH="${LOG_DIR}/vps-edge-ssh.log"
+L_REMNA="${LOG_DIR}/vm
+
+```bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+###############################################################################
+# vps-edge-run.sh
+#
+# ABSOLUTELY NO WARRANTIES. USE AT YOUR OWN RISK.
+###############################################################################
+
+# -------------------------- Pretty logging --------------------------
+LOG_TS="${EDGE_LOG_TS:-1}"
+ts() { [[ "$LOG_TS" == "1" ]] && date +"%Y-%m-%d %H:%M:%S" || true; }
+
+c_reset=$'\033[0m'
+c_dim=$'\033[2m'
+c_bold=$'\033[1m'
+c_red=$'\033[31m'
+c_yel=$'\033[33m'
+c_grn=$'\033[32m'
+c_cyan=$'\033[36m'
+
+color() { local code="$1"; shift; printf "%s%s%s" "$code" "$*" "$c_reset"; }
+_pfx() { printf "%s%s%s" "${c_dim}" "$(ts) " "${c_reset}"; }
+
+ok()   { _pfx; color "$c_grn" "✅ OK";    printf " %s\n" "$*"; }
+info() { _pfx; color "$c_cyan" "ℹ️ ";     printf " %s\n" "$*"; }
+warn() { _pfx; color "$c_yel" "⚠️  WARN"; printf " %s\n" "$*"; }
+err()  { _pfx; color "$c_red" "🛑 ERROR"; printf " %s\n" "$*"; }
+
+hdr() { echo; color "$c_bold$c_cyan" "$*"; echo; }
+die() { err "$*"; exit 1; }
+
+# -------------------------- Root helper --------------------------
+need_root() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then return 0; fi
+  die "Not root. Use: curl ... | sudo bash -s -- apply ..."
 }
 
 # -------------------------- Args --------------------------
@@ -185,7 +274,7 @@ kernel_profile_from_log() {
 }
 kernel_planned_from_log() {
   awk '
-    $0 ~ /^Planned \(computed targets\)/ {in=1; next}
+    $0 ~ /^Planned $begin:math:text$computed targets$end:math:text$/ {in=1; next}
     in && $0 ~ /^[A-Za-z]/ && $0 ~ /\|/ { print $0 }
     in && $0 ~ /^$/ { exit }
   ' "$L_KERNEL" 2>/dev/null || true
@@ -212,70 +301,68 @@ remnanode_logrotate_policy() {
   fi
 }
 
-# -------------------------- Asset runner --------------------------
-_run_asset_common() {
+# -------------------------- Asset helpers --------------------------
+download_asset() {
+  # $1 name, $2 url, $3 log_file
   local name="$1" url="$2" log_file="$3"
   local tmp="${ASSETS_TMP}/${name}.sh"
 
-  info "Running asset: ${name}"
   : >"$log_file" || true
-
-  if ! curl -fsSL "$url" -o "$tmp" >>"$log_file" 2>&1; then
+  info "Running asset: ${name}"
+  if ! curl -fsSL "$url" -o "$tmp" 2>&1 | tee -a "$log_file"; then
     warn "${name} download failed: ${url}"
     return 2
   fi
-  chmod +x "$tmp" >>"$log_file" 2>&1 || true
-
+  chmod +x "$tmp" 2>&1 | tee -a "$log_file" >/dev/null || true
   echo "$tmp"
 }
 
 run_asset() {
   local name="$1" url="$2" log_file="$3"
   local tmp
-  tmp="$(_run_asset_common "$name" "$url" "$log_file")" || return $?
+  tmp="$(download_asset "$name" "$url" "$log_file")" || return $?
+
   set +e
   bash "$tmp" 2>&1 | tee -a "$log_file"
   local rc=${PIPESTATUS[0]}
   set -e
+
   [[ $rc -eq 0 ]] && ok "${name} finished" || warn "${name} exited with code=${rc} (see ${log_file})"
   return "$rc"
 }
 
 run_asset_with_stdin() {
+  # stdin_payload is fed into asset (for read -p scripts)
   local name="$1" url="$2" log_file="$3" stdin_payload="$4"
   local tmp
-  tmp="$(_run_asset_common "$name" "$url" "$log_file")" || return $?
+  tmp="$(download_asset "$name" "$url" "$log_file")" || return $?
+
   set +e
   printf "%b" "$stdin_payload" | bash "$tmp" 2>&1 | tee -a "$log_file"
-  local rc=${PIPESTATUS[1]}
+  local rc=${PIPESTATUS[1]}   # bash exit code in printf|bash|tee pipeline
   set -e
+
   [[ $rc -eq 0 ]] && ok "${name} finished" || warn "${name} exited with code=${rc} (see ${log_file})"
   return "$rc"
 }
 
 run_asset_tty() {
-  # For interactive assets (tailscale, hostname, anything that needs /dev/tty)
+  # Runs asset with stdin attached to /dev/tty (needed for interactive tailscale/hostname)
   local name="$1" url="$2" log_file="$3"
   local tmp
-  tmp="$(_run_asset_common "$name" "$url" "$log_file")" || return $?
+  tmp="$(download_asset "$name" "$url" "$log_file")" || return $?
 
-  if [[ ! -e /dev/tty ]]; then
-    warn "${name}: /dev/tty not available — running non-tty mode"
+  if [[ -e /dev/tty ]]; then
     set +e
-    bash "$tmp" 2>&1 | tee -a "$log_file"
+    bash "$tmp" </dev/tty 2>&1 | tee -a "$log_file"
     local rc=${PIPESTATUS[0]}
     set -e
     [[ $rc -eq 0 ]] && ok "${name} finished" || warn "${name} exited with code=${rc} (see ${log_file})"
     return "$rc"
   fi
 
-  set +e
-  bash "$tmp" </dev/tty 2>&1 | tee -a "$log_file"
-  local rc=${PIPESTATUS[0]}
-  set -e
-
-  [[ $rc -eq 0 ]] && ok "${name} finished" || warn "${name} exited with code=${rc} (see ${log_file})"
-  return "$rc"
+  warn "${name}: /dev/tty not available — running without tty"
+  run_asset "$name" "$url" "$log_file"
 }
 
 # -------------------------- Timezone --------------------------
@@ -436,7 +523,7 @@ EOF
 apply_cmd() {
   need_root "$@"
 
-  # Hostname asset (interactive-only)
+  # Hostname asset (interactive)
   hdr "🖥️  Hostname"
   if run_asset_tty "hostname-bootstrap" "$ASSET_HOSTNAME" "$L_HOSTNAME"; then S_HOSTNAME=0; else S_HOSTNAME=$?; fi
 
@@ -459,14 +546,13 @@ apply_cmd() {
       else
         S_DNS=$?
       fi
-      ok "dns-switcher auto-applied (profile ${ARG_DNS_PROFILE}) (see $L_DNS)"
+      [[ $S_DNS -eq 0 ]] && ok "dns-switcher auto-applied (profile ${ARG_DNS_PROFILE}) (see $L_DNS)"
     else
       if run_asset_tty "dns-bootstrap" "$ASSET_DNS" "$L_DNS"; then S_DNS=0; else S_DNS=$?; fi
-      ok "dns-switcher applied (interactive) (see $L_DNS)"
     fi
   fi
 
-  # Tailscale (MUST be tty)
+  # Tailscale (tty!)
   if [[ "${ARG_TAILSCALE}" == "1" ]]; then
     hdr "🧠 Tailscale"
     if run_asset_tty "tailscale-bootstrap" "$ASSET_TAILSCALE" "$L_TS"; then S_TS=0; else S_TS=$?; fi
@@ -492,7 +578,7 @@ apply_cmd() {
   hdr "💅 Zsh"
   if run_asset "zsh-bootstrap" "$ASSET_ZSH" "$L_ZSH"; then S_ZSH=0; else S_ZSH=$?; fi
 
-  # Kernel tuning (do not stop on non-zero)
+  # Kernel tuning
   hdr "🧠 Kernel + system tuning"
   if run_asset "kernel-bootstrap" "$ASSET_KERNEL" "$L_KERNEL"; then
     S_KERNEL=0
