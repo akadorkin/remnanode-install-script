@@ -658,11 +658,11 @@ dns_apply() {
   echo "  - /etc/dns-switcher-backup"
 }
 
-
 ###############################################################################
 # Tailscale (quiet; idempotent; must end with a working IPv4 on tailscale0)
 # - If tailscale0 exists but has no IPv4 -> purge + reinstall via install.sh
-# - Always prints auth URL (via tailscale login) and waits for Enter on /dev/tty
+# - Prints auth URL (via tailscale login) ONLY if device needs login
+# - Waits for Enter on /dev/tty (if available)
 ###############################################################################
 tailscale_install_if_needed() {
   : >"$TS_LOG" 2>/dev/null || true
@@ -763,13 +763,30 @@ tailscale_reinstall_if_broken() {
   tailscale_restart_daemon
 }
 
+# --- NEW: explicit auth check via BackendState (idempotent, no forced logout) ---
+tailscale_backend_state() {
+  # Running | NeedsLogin | Stopped | ...
+  tailscale status --json 2>/dev/null | jq -r '.BackendState // empty' 2>/dev/null || true
+}
+
+tailscale_is_authorized() {
+  local st
+  st="$(tailscale_backend_state)"
+  [[ "$st" == "Running" ]] && return 0
+  return 1
+}
+
 tailscale_print_auth_url_and_wait() {
-  # Make URL flow reliable:
-  # - logout first, then login (prints URL), then wait for Enter
-  tailscale logout >>"$TS_LOG" 2>&1 || true
+  # If already authorized -> no-op
+  if tailscale_is_authorized; then
+    ok "tailscale already authorized (BackendState=Running) -> skip login"
+    return 0
+  fi
 
   local out="/tmp/vps-edge-tailscale-login.log"
   rm -f "$out" 2>/dev/null || true
+
+  info "Tailscale needs login -> running 'tailscale login' to obtain auth URL"
 
   set +e
   tailscale login 2>&1 | tee "$out" >>"$TS_LOG"
@@ -788,15 +805,27 @@ tailscale_print_auth_url_and_wait() {
     else
       warn "No /dev/tty available to wait for confirmation."
     fi
-    return 0
+  else
+    warn "Auth URL not found in tailscale login output."
+    warn "If the server is already authorized, it's OK. Otherwise run manually:"
+    warn "  tailscale login"
   fi
 
-  warn "Auth URL not found in tailscale login output (see $TS_LOG)"
+  # Wait until authorization is actually detected
+  for _i in {1..60}; do
+    if tailscale_is_authorized; then
+      ok "tailscale authorization detected (BackendState=Running)"
+      return 0
+    fi
+    sleep 1
+  done
+
+  warn "tailscale still not authorized (BackendState=$(tailscale_backend_state:-?))"
   return 1
 }
 
 tailscale_up_ssh_quiet() {
-  # After user approval, bring up with ssh enabled
+  # Bring up with ssh enabled; errors are validated by later "wait for Running + IPv4"
   tailscale up --ssh >>"$TS_LOG" 2>&1 || true
 }
 
@@ -811,8 +840,8 @@ tailscale_apply() {
   # If interface exists but is broken -> reinstall first (purge+install.sh)
   tailscale_reinstall_if_broken
 
-  # If already up and has IPv4 -> OK
-  if tailscale_is_up && tailscale_iface_has_ipv4; then
+  # If already up and has IPv4 and is authorized -> OK
+  if tailscale_is_up && tailscale_iface_has_ipv4 && tailscale_is_authorized; then
     local ip name
     ip="$(tailscale_ip4)"
     [[ -n "$ip" ]] && ok "tailscale is up (ip ${ip})" || ok "tailscale is up"
@@ -822,21 +851,23 @@ tailscale_apply() {
     return 0
   fi
 
-  # Not up / not healthy -> print auth URL + wait, then up --ssh
+  # Not authorized -> print auth URL + wait; if already authorized, it will no-op
   tailscale_print_auth_url_and_wait || true
+
+  # Bring it up with ssh enabled
   tailscale_up_ssh_quiet
 
-  # Wait for IPv4 on tailscale0 (critical for "SSH over Tailscale must work")
+  # Wait for IPv4 on tailscale0 AND BackendState=Running
   local ip=""
   for _i in {1..60}; do
     ip="$(tailscale_ip4)"
-    if [[ -n "$ip" ]] && tailscale_iface_has_ipv4; then
+    if [[ -n "$ip" ]] && tailscale_iface_has_ipv4 && tailscale_is_authorized; then
       break
     fi
     sleep 1
   done
 
-  if [[ -n "$ip" ]] && tailscale_iface_has_ipv4; then
+  if [[ -n "$ip" ]] && tailscale_iface_has_ipv4 && tailscale_is_authorized; then
     ok "tailscale is up (ip ${ip})"
     local name
     name="$(tailscale_magicdns_name)"
@@ -846,32 +877,31 @@ tailscale_apply() {
   fi
 
   # last remediation: restart once and retry login/up
-  warn "tailscale IPv4 not detected yet -> restarting tailscaled and retrying"
+  warn "tailscale not ready yet (no IPv4 or not authorized) -> restarting tailscaled and retrying"
   tailscale_restart_daemon
   tailscale_print_auth_url_and_wait || true
   tailscale_up_ssh_quiet
 
   for _i in {1..30}; do
     ip="$(tailscale_ip4)"
-    if [[ -n "$ip" ]] && tailscale_iface_has_ipv4; then
+    if [[ -n "$ip" ]] && tailscale_iface_has_ipv4 && tailscale_is_authorized; then
       break
     fi
     sleep 1
   done
 
-  if [[ -n "$ip" ]] && tailscale_iface_has_ipv4; then
+  if [[ -n "$ip" ]] && tailscale_iface_has_ipv4 && tailscale_is_authorized; then
     ok "tailscale is up (ip ${ip})"
     local name
     name="$(tailscale_magicdns_name)"
     [[ -n "$name" ]] && ok "MagicDNS: ${name}" || warn "MagicDNS name not available (maybe disabled)."
     TAILSCALE_READY="1"
   else
-    warn "tailscale still has no IPv4 on tailscale0."
+    warn "tailscale still not ready: ipv4=$(tailscale_ip4:-none), BackendState=$(tailscale_backend_state:-?)"
     warn "This is unsafe to proceed with UFW (can lock you out). We'll skip enabling UFW."
     TAILSCALE_READY="0"
   fi
 }
-
 
 ###############################################################################
 # User management
@@ -1742,7 +1772,7 @@ apply_cmd() {
     tailscale_apply
     # If tailscale got IPv4 on tailscale0 -> ready, else we already warned and will skip UFW
     if [[ "${TAILSCALE_READY:-0}" != "1" ]]; then
-      warn "tailscale not ready (no IPv4) -> UFW will be skipped."
+      warn "tailscale not ready (no IPv4 or not authorized) -> UFW will be skipped."
     fi
   fi
 
