@@ -335,7 +335,6 @@ disable_omz_updates_in_zshrc() {
 disable_omz_updates_in_zshrc "${HOME_DIR}/.zshrc"
 disable_omz_updates_in_zshrc "/root/.zshrc"
 
-# На всякий случай — по всем пользователям
 while IFS= read -r -d '' f; do
   disable_omz_updates_in_zshrc "$f" || true
 done < <(find /home -maxdepth 3 -type f -name ".zshrc" -print0 2>/dev/null || true)
@@ -449,6 +448,81 @@ case "${SSH_HARDEN,,}" in
     warn "SSH hardening пропущен"
     ;;
 esac
+
+# ---------------------- FAIL2BAN (HARD) ----------------------
+log "Установка и настройка Fail2ban (очень жестко: sshd + sshd-ddos + recidive, экспоненциальный bantime)"
+
+aptq "Установка fail2ban" install fail2ban
+
+# Лог fail2ban нужен для recidive
+touch /var/log/fail2ban.log
+chmod 640 /var/log/fail2ban.log || true
+
+install -m 0644 /dev/stdin /etc/fail2ban/fail2ban.local <<'EOF_F2B_LOCAL'
+[Definition]
+logtarget = /var/log/fail2ban.log
+EOF_F2B_LOCAL
+
+# Жесткие дефолты + экспоненциальный рост бана
+install -m 0644 /dev/stdin /etc/fail2ban/jail.d/00-defaults.local <<'EOF_F2B_DEFAULTS'
+[DEFAULT]
+banaction = ufw
+backend   = systemd
+
+# Очень агрессивно:
+findtime = 5m
+maxretry = 2
+bantime  = 6h
+
+# Экспонента: 6h -> 12h -> 24h -> ...
+bantime.increment = true
+bantime.factor    = 2
+bantime.maxtime   = 4w
+bantime.rndtime   = 10m
+
+# Не баним локал и tailscale
+ignoreip = 127.0.0.1/8 ::1 100.64.0.0/10
+
+# Режем шум в логах
+usedns = warn
+EOF_F2B_DEFAULTS
+
+# sshd (агрессивный)
+install -m 0644 /dev/stdin /etc/fail2ban/jail.d/sshd.local <<EOF_SSHD
+[sshd]
+enabled = true
+port    = ${SSH_PORT}
+mode    = aggressive
+EOF_SSHD
+
+# sshd-ddos (доп. защита от "медленных" переборов/сканов)
+install -m 0644 /dev/stdin /etc/fail2ban/jail.d/sshd-ddos.local <<EOF_SSHD_DDOS
+[sshd-ddos]
+enabled  = true
+port     = ${SSH_PORT}
+mode     = aggressive
+findtime = 2m
+maxretry = 2
+bantime  = 12h
+EOF_SSHD_DDOS
+
+# recidive: повторные попадания -> бан на 4 недели
+install -m 0644 /dev/stdin /etc/fail2ban/jail.d/recidive.local <<'EOF_RECIDIVE'
+[recidive]
+enabled  = true
+logpath  = /var/log/fail2ban.log
+findtime = 7d
+maxretry = 3
+bantime  = 4w
+EOF_RECIDIVE
+
+runq "enable fail2ban" systemctl enable --now fail2ban
+runq "restart fail2ban" systemctl restart fail2ban
+
+fail2ban-client ping >/dev/null 2>&1 && ok "fail2ban отвечает" || warn "fail2ban-client ping не прошёл"
+fail2ban-client status sshd 2>/dev/null || true
+fail2ban-client status sshd-ddos 2>/dev/null || true
+fail2ban-client status recidive 2>/dev/null || true
 
 # tailscale up — берём только URL
 log "Запуск tailscale up (ожидание авторизации)"
@@ -649,9 +723,6 @@ node_exporter_install
 log "Тюнинг ядра/сети (встроенный патчер) — apply"
 
 edge_tuning_apply() {
-  # ВНИМАНИЕ: это встроенная версия твоего скрипта.
-  # Минимальное изменение: НЕ трогаем /etc/sysctl.d/99-tailscale-forwarding.conf (чтобы tailscale не ломать).
-
   set -Eeuo pipefail
 
   LOG_TS="${EDGE_LOG_TS:-1}"
@@ -1088,7 +1159,7 @@ edge_tuning_apply() {
       [[ -f "$f" ]] || continue
       case "$f" in
         /etc/sysctl.d/90-edge-network.conf|/etc/sysctl.d/92-edge-safe.conf|/etc/sysctl.d/95-edge-forward.conf|/etc/sysctl.d/96-edge-vm.conf|/etc/sysctl.d/99-edge-conntrack.conf) continue ;;
-        /etc/sysctl.d/99-tailscale-forwarding.conf) continue ;; # <-- важно: не трогаем tailscale sysctl
+        /etc/sysctl.d/99-tailscale-forwarding.conf) continue ;;
       esac
       if grep -Eq 'nf_conntrack_|tcp_congestion_control|default_qdisc|ip_forward|somaxconn|netdev_max_backlog|tcp_rmem|tcp_wmem|rmem_max|wmem_max|vm\.swappiness|vfs_cache_pressure|tcp_syncookies|tcp_max_tw_buckets|tcp_keepalive|tcp_mtu_probing|tcp_fin_timeout|tcp_tw_reuse|tcp_slow_start_after_idle|tcp_rfc1337' "$f"; then
         move_aside2 "$f"
@@ -1286,7 +1357,7 @@ EOM
 edge_tuning_apply
 
 # ---------------------- DNS SWITCHER (встроенный скрипт) ----------------------
-log "DNS switcher (встроенный) — интерактивно"
+log "DNS switcher (встроенный) — сразу предлагает DNS (без подтверждения)"
 
 dns_switcher_run() {
   set -euo pipefail
@@ -1482,15 +1553,10 @@ EOF
 
   show_current_dns
 
-  local confirm=""
-  read_tty confirm "Do you want to proceed with DNS configuration? (y/N): "
-  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-    print_message "$YELLOW" "Operation cancelled."
-    return 0
-  fi
-
+  # Без подтверждения: сразу выбор DNS
   local DNS_SERVERS="" FALLBACK_DNS=""
   get_dns_servers || return 1
+
   create_backup
   configure_dns
   restart_pbr
@@ -1537,44 +1603,7 @@ case "${REBOOT_DELAY}" in
     ;;
 esac
 
-# ---------------------- ФИНАЛ ----------------------
-echo
-echo "✅ Готово."
-echo "Логи:"
-echo "  • APT:               $APT_LOG"
-echo "  • Docker:            /var/log/install-docker.log"
-echo "  • Tailscale:         /var/log/install-tailscale.log"
-echo
-
-EXT_IP="$(curl -fsSL ifconfig.me 2>/dev/null || curl -fsSL https://api.ipify.org 2>/dev/null || true)"
-[[ -z "$EXT_IP" ]] && EXT_IP="не определён"
-
-SSH_PASS_AUTH="$(get_sshd_effective PasswordAuthentication)"
-SSH_ROOT_LOGIN="$(get_sshd_effective PermitRootLogin)"
-
-echo "UFW:"
-echo "  • Входящие: deny (кроме портов: ${OPEN_PORTS[*]} на интерфейсе ${INTERNET_IFACE:-unknown})"
-echo "  • Исходящие: allow"
-echo "  • tailscale0: полный доступ in/out"
-echo "  • Docker-интерфейсы (docker0/br-*): полный доступ in/out (если найдены)"
-echo "SSH:"
-echo "  • Порт SSH (переменная): ${SSH_PORT}"
-echo "  • PasswordAuthentication: ${SSH_PASS_AUTH}"
-echo "  • PermitRootLogin:       ${SSH_ROOT_LOGIN}"
-echo "🌐 Внешний IP: ${EXT_IP}"
-echo "🧅  Tailscale IP: ${TS_IP:-не назначен}"
-if [[ -n "${PASS_GEN:-}" ]]; then
-  echo "🔑 Пароль для ${USER_NAME}: ${PASS_GEN}"
-else
-  echo "🔑 Пароль для ${USER_NAME}: (не менялся)"
-fi
-
-echo
-echo "Запуск:"
-echo "  sudo bash initial7.sh --user=${USER_NAME} --timezone=${TIMEZONE} --remnanode=${REMNANODE} --reboot=0"
-echo
-# ---------------------- ФИНАЛЬНЫЙ ОТЧЁТ: ЧТО ИЗМЕНИЛИ ----------------------
-fmt_yesno() { [[ "${1:-}" == "1" ]] && echo "yes" || echo "no"; }
+# ---------------------- ФИНАЛЬНЫЙ ОТЧЁТ ----------------------
 
 get_journald_caps_now() {
   local f="/etc/systemd/journald.conf.d/90-edge.conf"
@@ -1606,7 +1635,6 @@ get_swap_now() {
 }
 
 get_dns_now() {
-  # Вернём коротко: DNS Servers + Fallback DNS по systemd-resolved
   resolvectl status 2>/dev/null | awk '
     /DNS Servers:/ {p=1; print; next}
     /Fallback DNS:/ {p=0; print; next}
@@ -1615,7 +1643,6 @@ get_dns_now() {
 }
 
 tailscale_magicdns_full() {
-  # На новых версиях tailscale status --json отдаёт Self.DNSName (полный magicdns fqdn)
   if command -v tailscale >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
     tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | head -n1
   else
@@ -1646,16 +1673,11 @@ list_changed_files() {
 /etc/cron.d/enable-ufw                          (ufw)
 /usr/local/bin/ufw-blocklist-update.sh          (ufw)
 /etc/cron.d/ufw-blocklist                       (ufw)
+/etc/logrotate.d/remnanode                      (remnanode logs)
+/etc/fail2ban/*                                 (fail2ban hardening)
+/var/log/fail2ban.log                           (fail2ban log)
 EOF_FILES
 }
-
-echo
-echo "✅ Готово."
-echo "Логи:"
-echo "  • APT:               $APT_LOG"
-echo "  • Docker:            /var/log/install-docker.log"
-echo "  • Tailscale:         /var/log/install-tailscale.log"
-echo
 
 EXT_IP="$(curl -fsSL ifconfig.me 2>/dev/null || curl -fsSL https://api.ipify.org 2>/dev/null || true)"
 [[ -z "$EXT_IP" ]] && EXT_IP="не определён"
@@ -1663,12 +1685,30 @@ EXT_IP="$(curl -fsSL ifconfig.me 2>/dev/null || curl -fsSL https://api.ipify.org
 SSH_PASS_AUTH="$(get_sshd_effective PasswordAuthentication)"
 SSH_ROOT_LOGIN="$(get_sshd_effective PermitRootLogin)"
 
-TS_IP="$(tailscale ip -4 2>/dev/null || true)"
-TS_DNS="$(tailscale_magicdns_full || true)"
-if [[ -z "${TS_DNS:-}" ]]; then
-  TS_DNS="(не удалось получить; проверь: tailscale status --json | jq -r .Self.DNSName)"
-fi
+TS_IP_NOW="$(tailscale ip -4 2>/dev/null || true)"
+TS_DNS_NOW="$(tailscale_magicdns_full || true)"
+[[ -z "${TS_DNS_NOW:-}" ]] && TS_DNS_NOW="(не удалось получить; проверь: tailscale status --json | jq -r .Self.DNSName)"
 
+REBOOT_LINE=""
+case "${REBOOT_DELAY}" in
+  0|no|none|skip|"") REBOOT_LINE="⚠️ Перезагрузка отключена (параметр --reboot=${REBOOT_DELAY})." ;;
+  30s|30sec|30)      REBOOT_LINE="⚠️ Перезагрузка через 30 секунд" ;;
+  5m|5min|300)       REBOOT_LINE="⚠️ Перезагрузка через 5 минут" ;;
+  *)                 REBOOT_LINE="⚠️ Перезагрузка через ${REBOOT_DELAY}" ;;
+esac
+
+echo
+echo "✅ Готово."
+echo
+echo "=> Autoremove"
+echo "✔ Autoremove — ok"
+echo "${REBOOT_LINE}"
+echo
+echo "Логи:"
+echo "  • APT:               $APT_LOG"
+echo "  • Docker:            /var/log/install-docker.log"
+echo "  • Tailscale:         /var/log/install-tailscale.log"
+echo
 echo "UFW:"
 echo "  • Входящие: deny (кроме портов: ${OPEN_PORTS[*]} на интерфейсе ${INTERNET_IFACE:-unknown})"
 echo "  • Исходящие: allow"
@@ -1680,9 +1720,13 @@ echo "  • Порт SSH (переменная): ${SSH_PORT}"
 echo "  • PasswordAuthentication: ${SSH_PASS_AUTH}"
 echo "  • PermitRootLogin:       ${SSH_ROOT_LOGIN}"
 echo
+echo "Fail2ban:"
+echo "  • status: $(systemctl is-active fail2ban 2>/dev/null || echo 'unknown')"
+echo "  • jails:  $(fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:\s*//p' | tr -d '\r' || true)"
+echo
 echo "🌐 Внешний IP: ${EXT_IP}"
-echo "🧅  Tailscale IP: ${TS_IP:-не назначен}"
-echo "🧅  Tailscale MagicDNS: ${TS_DNS}"
+echo "🧅  Tailscale IP: ${TS_IP_NOW:-не назначен}"
+echo "🧅  Tailscale MagicDNS: ${TS_DNS_NOW}"
 if [[ -n "${PASS_GEN:-}" ]]; then
   echo "🔑 Пароль для ${USER_NAME}: ${PASS_GEN}"
 else
@@ -1722,12 +1766,12 @@ echo "Services:"
 echo "  • tailscaled:     $(systemctl is-active tailscaled 2>/dev/null || echo 'unknown')"
 echo "  • node_exporter:  $(systemctl is-active node_exporter 2>/dev/null || echo 'unknown')"
 echo "  • docker:         $(systemctl is-active docker 2>/dev/null || echo 'unknown')"
+echo "  • fail2ban:       $(systemctl is-active fail2ban 2>/dev/null || echo 'unknown')"
 echo
 echo "Files created/overwritten by this script (key ones):"
 list_changed_files | sed 's/^/  • /'
 echo "===================================================================="
 echo
-
 echo "Запуск:"
 echo "  sudo bash initial7.sh --user=${USER_NAME} --timezone=${TIMEZONE} --remnanode=${REMNANODE} --reboot=0"
 echo
