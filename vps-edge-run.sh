@@ -7,14 +7,19 @@ TIMEZONE="Europe/Moscow"
 REBOOT_DELAY="5m"   # 30s | 5m | 300 | 0|none|skip - без ребута
 SSH_PORT="${SSH_PORT:-22}"
 REMNANODE="0"       # 0 - не трогаем remnanode, 1 - спросить параметры и создать compose, если его нет
-DNS_SWITCH="0"      # 0/1 — запуск dns-switcher после node-exporter
+
+# Опциональные шаги ПОСЛЕ node-exporter (включаются флагами)
+DNS_SWITCH="0"          # 0/1 — запуск dns-switcher после node-exporter
+DNS_SWITCH_ARGS=""      # строка с аргументами для dns-switcher (как есть)
+NET_TUNING="0"          # 0/1 — запуск vps-network-tuning-script после node-exporter
+NET_TUNING_ARGS=""      # строка с аргументами для vps-network-tuning (после "apply")
+
+# hostname (asked interactively, no flags)
+HOST_NAME=""
 
 # remnanode params (asked early if REMNANODE=1)
 NODE_PORT=""
 SECRET_KEY=""
-
-# hostname (asked interactively, no flags)
-HOST_NAME=""
 
 # Порты, которые должны быть открыты на внешнем интерфейсе
 OPEN_PORTS=(1080 1090 443 80 1480 1194)
@@ -25,13 +30,21 @@ while [[ $# -gt 0 ]]; do
     --timezone=*) TIMEZONE="${1#*=}"; shift ;;
     --reboot=*) REBOOT_DELAY="${1#*=}"; shift ;;
     --remnanode=*) REMNANODE="${1#*=}"; shift ;;
+
     --dns-switch=*) DNS_SWITCH="${1#*=}"; shift ;;
+    --dns-switch-args=*) DNS_SWITCH_ARGS="${1#*=}"; shift ;;
+    --net-tuning=*) NET_TUNING="${1#*=}"; shift ;;
+    --net-tuning-args=*) NET_TUNING_ARGS="${1#*=}"; shift ;;
 
     --user) USER_NAME="${2:-}"; shift 2 ;;
     --timezone) TIMEZONE="${2:-}"; shift 2 ;;
     --reboot) REBOOT_DELAY="${2:-}"; shift 2 ;;
     --remnanode) REMNANODE="${2:-0}"; shift 2 ;;
+
     --dns-switch) DNS_SWITCH="${2:-0}"; shift 2 ;;
+    --dns-switch-args) DNS_SWITCH_ARGS="${2:-}"; shift 2 ;;
+    --net-tuning) NET_TUNING="${2:-0}"; shift 2 ;;
+    --net-tuning-args) NET_TUNING_ARGS="${2:-}"; shift 2 ;;
 
     --nettest=*|--nettest) # deprecated: accepted for backward compatibility, ignored
       shift ;;
@@ -65,28 +78,9 @@ read_tty_silent(){
   printf -v "$__var" '%s' "$__v"
 }
 
-# ---------------------- DOWNLOAD HELPERS (keep files in /root) ----------------------
-download_to_root() {
-  local url="$1"
-  local name="$2"
-  local out="/root/${name}"
-
-  runq "download ${name}" curl -fsSL "$url" -o "$out"
-  chmod +x "$out" || true
-  echo "$out"
-}
-
-run_local() {
-  # run_local "msg" "command..."
-  local msg="$1"; shift
-  runq "$msg" bash -lc "$* < /dev/null"
-}
-
 # ---------------------- SSHD HELPERS ----------------------
 SSHD_CONFIG="/etc/ssh/sshd_config"
 get_sshd_effective(){
-  # Возвращает "ключ значение" последнего (побеждает последний) некомментированного вхождения ключа.
-  # Пример: get_sshd_effective PasswordAuthentication -> "yes/no/(unset)"
   local key="$1"
   if [[ -f "$SSHD_CONFIG" ]]; then
     local val
@@ -110,7 +104,6 @@ get_sshd_effective(){
 }
 
 restart_sshd(){
-  # На разных дистрах сервис может называться ssh или sshd
   systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
 }
 
@@ -135,7 +128,7 @@ else
   warn "hostname пропущен"
 fi
 
-log "Параметры: user='${USER_NAME:-<ask>}' timezone='${TIMEZONE}' reboot='${REBOOT_DELAY}' remnanode='${REMNANODE}' dns-switch='${DNS_SWITCH}'"
+log "Параметры: user='${USER_NAME:-<ask>}' timezone='${TIMEZONE}' reboot='${REBOOT_DELAY}' remnanode='${REMNANODE}' dns-switch='${DNS_SWITCH}' net-tuning='${NET_TUNING}'"
 if [[ -z "${USER_NAME}" ]]; then
   read_tty USER_NAME "Введите имя пользователя для создания (например, akadorkin): "
   [[ -n "$USER_NAME" ]] || { err "user пуст"; exit 1; }
@@ -184,18 +177,6 @@ EOF_SYS
   ok "FD лимиты применены"
 }
 
-# ---------------------- PERF PROFILE (download to /root and run locally) ----------------------
-apply_perf_profile() {
-  log "Perf-профиль сети (vps-network-tuning-script: initial.sh apply)"
-  local PERF_SH
-  PERF_SH="$(download_to_root \
-    "https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/main/initial.sh" \
-    "vps-network-tuning-initial.sh")"
-
-  run_local "vps-network-tuning apply" "sudo bash '${PERF_SH}' apply" || true
-  ok "Perf-профиль применён"
-}
-
 # ---------------------- ТАЙМЗОНА ----------------------
 log "Настройка таймзоны → ${TIMEZONE}"
 runq "link /etc/localtime" ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime || true
@@ -226,9 +207,8 @@ aptq "Установка базовых пакетов" install \
 runq "enable cron" systemctl enable --now cron >/dev/null 2>&1 || true
 grep -q '^/usr/bin/zsh$' /etc/shells || echo '/usr/bin/zsh' >> /etc/shells
 
-# FD + perf после базовых пакетов
+# FD после базовых пакетов
 apply_fd_limits
-apply_perf_profile
 
 # ---------------------- DOCKER (ТИХО, через runq) ----------------------
 log "Установка Docker CE (тихо)"
@@ -614,24 +594,35 @@ EOF
 
 # ---------------------- NODE EXPORTER (важно: после UFW) ----------------------
 log "Установка node-exporter (важно: после UFW)"
-NODE_SH="$(download_to_root \
-  "https://raw.githubusercontent.com/hteppl/sh/master/node_install.sh" \
-  "node_install.sh")"
-run_local "node_exporter install" "bash '${NODE_SH}'" || true
+NODE_SH="/root/node_install.sh"
+runq "download node_install.sh" bash -lc "curl -fsSL https://raw.githubusercontent.com/hteppl/sh/master/node_install.sh -o '$NODE_SH'"
+chmod +x "$NODE_SH" || true
+runq "node_exporter install" bash -lc "bash '$NODE_SH' < /dev/null" || true
+
+# ---------------------- VPS NETWORK TUNING (опционально, после node-exporter) ----------------------
+if [[ "${NET_TUNING}" == "1" ]]; then
+  log "net-tuning=1 → запускаю vps-network-tuning-script"
+  NET_SH="/root/vps-network-tuning-initial.sh"
+  runq "download vps-network-tuning initial.sh" bash -lc "curl -fsSL https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/main/initial.sh -o '$NET_SH'"
+  chmod +x "$NET_SH" || true
+  runq "vps-network-tuning apply" bash -lc "sudo bash '$NET_SH' apply ${NET_TUNING_ARGS} < /dev/null" || true
+else
+  ok "net-tuning=0 — пропускаю vps-network-tuning"
+fi
 
 # ---------------------- DNS SWITCHER (опционально, после node-exporter) ----------------------
 if [[ "${DNS_SWITCH}" == "1" ]]; then
   log "dns-switch=1 → запускаю dns-switcher"
-  DNS_SH="$(download_to_root \
-    "https://raw.githubusercontent.com/AndreyTimoschuk/dns-switcher/main/dns-switcher.sh" \
-    "dns-switcher.sh")"
-  run_local "run dns-switcher" "sudo bash '${DNS_SH}'" || true
+  DNS_SH="/root/dns-switcher.sh"
+  runq "download dns-switcher.sh" bash -lc "wget -q https://raw.githubusercontent.com/AndreyTimoschuk/dns-switcher/main/dns-switcher.sh -O '$DNS_SH'"
+  chmod +x "$DNS_SH" || true
+  runq "run dns-switcher" bash -lc "sudo bash '$DNS_SH' ${DNS_SWITCH_ARGS} < /dev/null" || true
 else
   ok "dns-switch=0 — пропускаю dns-switcher"
 fi
 
 # ---------------------- REMNANODE UP ----------------------
-if [[ -f "${REMNA_COMPOSE}" ]]; then
+if [[ -f "/opt/remnanode/docker-compose.yml" ]]; then
   log "Запуск remnanode (docker compose up -d)"
   runq "remnanode up" bash -lc 'cd /opt/remnanode && docker compose up -d'
 else
@@ -668,11 +659,9 @@ echo "  • Docker:            /var/log/install-docker.log"
 echo "  • Tailscale:         /var/log/install-tailscale.log"
 echo
 
-# ВНЕШНИЙ IP
 EXT_IP="$(curl -fsSL ifconfig.me 2>/dev/null || curl -fsSL https://api.ipify.org 2>/dev/null || true)"
 [[ -z "$EXT_IP" ]] && EXT_IP="не определён"
 
-# SSH effective values
 SSH_PASS_AUTH="$(get_sshd_effective PasswordAuthentication)"
 SSH_ROOT_LOGIN="$(get_sshd_effective PermitRootLogin)"
 
@@ -685,7 +674,7 @@ echo "SSH:"
 echo "  • Порт SSH (переменная): ${SSH_PORT}"
 echo "  • PasswordAuthentication: ${SSH_PASS_AUTH}"
 echo "  • PermitRootLogin:       ${SSH_ROOT_LOGIN}"
-echo "FD/perf:"
+echo "FD:"
 echo "  • fs.file-max: $(cat /proc/sys/fs/file-max 2>/dev/null || echo 'n/a')"
 echo "  • fs.nr_open:  $(cat /proc/sys/fs/nr_open 2>/dev/null || echo 'n/a')"
 echo "  • systemd DefaultLimitNOFILE: $(systemctl show --property=DefaultLimitNOFILE 2>/dev/null | cut -d= -f2 || echo 'n/a')"
@@ -696,3 +685,17 @@ if [[ -n "${PASS_GEN:-}" ]]; then
 else
   echo "🔑 Пароль для ${USER_NAME}: (не менялся)"
 fi
+
+echo
+echo "Примеры запуска:"
+echo "1) Всё включено (node-exporter + net-tuning apply + dns-switcher), без ребута:"
+echo "   sudo bash initial6.sh --user=${USER_NAME} --timezone=${TIMEZONE} --remnanode=1 --net-tuning=1 --dns-switch=1 --reboot=0"
+echo
+echo "2) Только node-exporter (после UFW), без доп. скриптов:"
+echo "   sudo bash initial6.sh --user=${USER_NAME} --timezone=${TIMEZONE} --remnanode=0 --net-tuning=0 --dns-switch=0 --reboot=0"
+echo
+echo "3) С аргументами для dns-switcher и net-tuning:"
+echo "   sudo bash initial6.sh --user=${USER_NAME} --timezone=${TIMEZONE} --remnanode=1 \\"
+echo "     --net-tuning=1 --net-tuning-args=\"<args after apply>\" \\"
+echo "     --dns-switch=1 --dns-switch-args=\"<args>\" \\"
+echo "     --reboot=0"
