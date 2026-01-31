@@ -6,10 +6,10 @@ set -Eeuo pipefail
 #
 # ABSOLUTELY NO WARRANTIES. USE AT YOUR OWN RISK.
 #
-# Fixes:
-# - NEVER pipe "logs" into bash. Assets are downloaded to files and executed.
-# - Interactive assets are attached to /dev/tty so Enter/prompts work.
-# - Full logs are shown to console + saved to /var/log/* via tee.
+# Key fix:
+# - Assets are downloaded to files (curl -sS + retries) and executed from file.
+# - If download fails -> we DO NOT attempt to execute missing file.
+# - Interactive assets attach stdin to /dev/tty.
 ###############################################################################
 
 # -------------------------- Pretty logging --------------------------
@@ -25,8 +25,8 @@ c_grn=$'\033[32m'
 c_cyan=$'\033[36m'
 
 _pfx() { printf "%s%s%s" "${c_dim}" "$(ts) " "${c_reset}"; }
-ok()   { _pfx; printf "%s✅ OK%s %s\n"    "$c_grn" "$c_reset" "$*"; }
-info() { _pfx; printf "%sℹ️  %s%s\n"     "$c_cyan" "$c_reset" "$*"; }
+ok()   { _pfx; printf "%s✅ OK%s %s\n"     "$c_grn" "$c_reset" "$*"; }
+info() { _pfx; printf "%sℹ️  %s%s\n"      "$c_cyan" "$c_reset" "$*"; }
 warn() { _pfx; printf "%s⚠️  WARN%s %s\n" "$c_yel" "$c_reset" "$*"; }
 err()  { _pfx; printf "%s🛑 ERROR%s %s\n" "$c_red" "$c_reset" "$*"; }
 
@@ -44,7 +44,7 @@ CMD="${1:-}"; shift || true
 
 ARG_USER=""
 ARG_TIMEZONE="Europe/Moscow"
-ARG_REBOOT="ask"          # ask|0|skip|30s|5m|...
+ARG_REBOOT="0"          # 0|ask|30s|5m|...
 
 ARG_TAILSCALE="0"
 ARG_DNS_SWITCHER="0"
@@ -101,7 +101,6 @@ L_UFW="${LOG_DIR}/vps-edge-ufw.log"
 L_SSH="${LOG_DIR}/vps-edge-ssh.log"
 L_REMNA="${LOG_DIR}/vps-edge-remnanode.log"
 
-# statuses for summary
 S_HOSTNAME=0 S_APT=0 S_DNS=0 S_TS=0 S_USER=0 S_ZSH=0 S_KERNEL=0 S_UFW=0 S_SSH=0 S_REMNA=0
 USER_CREATED="0"
 USER_PASS=""
@@ -114,8 +113,8 @@ mkdir -p "$ASSETS_TMP"
 host_short() { hostname -s 2>/dev/null || hostname; }
 
 ext_ip() {
-  curl -fsSL --max-time 3 https://api.ipify.org 2>/dev/null \
-    || curl -fsSL --max-time 3 ifconfig.me 2>/dev/null \
+  curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null \
+    || curl -fsS --max-time 3 ifconfig.me 2>/dev/null \
     || true
 }
 
@@ -196,48 +195,44 @@ remnanode_logrotate_policy() {
   fi
 }
 
-# -------------------------- Asset runner (FILE-based, NO piping into bash) --------------------------
+# -------------------------- Asset runner (strict) --------------------------
 download_asset() {
   local name="$1" url="$2" out="$3"
   info "Downloading asset: ${name}.sh"
-  curl -fsSL "$url" -o "$out"
-  chmod +x "$out"
-}
-
-run_asset() {
-  local name="$1" url="$2" log_file="$3"
-  local tmp="${ASSETS_TMP}/${name}.sh"
-
-  : >"$log_file" || true
-  set +e
-  {
-    download_asset "$name" "$url" "$tmp"
-    echo "----- RUN: ${tmp} -----"
-    bash "$tmp"
-  } 2>&1 | tee -a "$log_file"
-  local rc="${PIPESTATUS[0]}"
-  set -e
-
-  [[ $rc -eq 0 ]] && ok "${name} finished" || warn "${name} exited with code=${rc} (see ${log_file})"
-  return "$rc"
-}
-
-run_asset_tty() {
-  local name="$1" url="$2" log_file="$3"
-  local tmp="${ASSETS_TMP}/${name}.sh"
-
-  : >"$log_file" || true
-  if ! has_tty; then
-    warn "No /dev/tty — running ${name} without TTY (it may block/skip prompts)"
-    run_asset "$name" "$url" "$log_file"
-    return $?
+  # -sS: be silent but SHOW errors
+  # --retry: survive transient github hiccups
+  if ! curl -fL --retry 5 --retry-delay 1 --connect-timeout 5 --max-time 60 -sS "$url" -o "$out"; then
+    err "Download failed for ${name}"
+    err "URL: $url"
+    return 2
   fi
+  if [[ ! -s "$out" ]]; then
+    err "Downloaded file is empty: $out"
+    err "URL: $url"
+    return 2
+  fi
+  chmod +x "$out" || true
+  return 0
+}
+
+run_asset_common() {
+  local mode="$1" name="$2" url="$3" log_file="$4"
+  local tmp="${ASSETS_TMP}/${name}.sh"
+
+  : >"$log_file" || true
 
   set +e
   {
-    download_asset "$name" "$url" "$tmp"
-    echo "----- RUN (TTY): ${tmp} -----"
-    bash "$tmp" </dev/tty
+    if ! download_asset "$name" "$url" "$tmp"; then
+      echo "----- DOWNLOAD FAILED -----"
+      exit 2
+    fi
+    echo "----- RUN (${mode}): ${tmp} -----"
+    if [[ "$mode" == "TTY" && -e /dev/tty ]]; then
+      bash "$tmp" </dev/tty
+    else
+      bash "$tmp"
+    fi
   } 2>&1 | tee -a "$log_file"
   local rc="${PIPESTATUS[0]}"
   set -e
@@ -245,6 +240,9 @@ run_asset_tty() {
   [[ $rc -eq 0 ]] && ok "${name} finished" || warn "${name} exited with code=${rc} (see ${log_file})"
   return "$rc"
 }
+
+run_asset()     { info "Running asset: $1";     run_asset_common "STDIN" "$1" "$2" "$3"; }
+run_asset_tty() { info "Running asset (TTY): $1"; run_asset_common "TTY"   "$1" "$2" "$3"; }
 
 # -------------------------- Timezone --------------------------
 timezone_apply() {
@@ -256,30 +254,30 @@ timezone_apply() {
 
 # -------------------------- Reboot (ask at end) --------------------------
 ask_reboot() {
-  local r="${ARG_REBOOT:-ask}"
-  if [[ "$r" == "ask" ]]; then
-    if ! has_tty; then
-      info "No TTY — reboot skipped"
-      return 0
-    fi
-    echo
-    read -rp "Reboot now? [y/N]: " ans </dev/tty || true
-    case "${ans,,}" in
-      y|yes) warn "Rebooting now"; shutdown -r now ;;
-      *) info "Reboot skipped" ;;
-    esac
-    return 0
-  fi
+  local r="${ARG_REBOOT:-0}"
 
   case "$r" in
-    0|no|none|skip|"") info "Reboot disabled (--reboot=${r})" ;;
+    0|no|none|skip|"") info "Reboot disabled (--reboot=${r})"; return 0 ;;
+    ask)
+      if ! has_tty; then
+        info "No TTY — reboot skipped"
+        return 0
+      fi
+      echo
+      read -rp "Reboot now? [y/N]: " ans </dev/tty || true
+      case "${ans,,}" in
+        y|yes) warn "Rebooting now"; shutdown -r now ;;
+        *) info "Reboot skipped" ;;
+      esac
+      return 0
+      ;;
     30s|30sec|30) warn "Reboot in 30 seconds"; shutdown -r +0.5 >/dev/null 2>&1 || shutdown -r now ;;
     5m|5min|300)  warn "Reboot in 5 minutes";  shutdown -r +5   >/dev/null 2>&1 || shutdown -r now ;;
     *)            warn "Reboot in ${r}";        shutdown -r +"${r}" >/dev/null 2>&1 || shutdown -r now ;;
   esac
 }
 
-# -------------------------- Summary (final) --------------------------
+# -------------------------- Summary --------------------------
 print_summary() {
   hdr "🧾 Summary"
 
@@ -299,37 +297,28 @@ print_summary() {
   echo "💾 Disk /    : ~${rootg} GiB"
   echo "🧊 Swap      : ~${swapm} MiB"
   echo
-
   echo "🧠 Tailscale : ${tsip:-"-"}"
   echo "🔗 MagicDNS  : ${tsname:-"-"}"
   echo
-
   echo "🌐 DNS       : $(dns_profile_from_resolved)"
   echo "🔗 Repo DNS  : https://github.com/AndreyTimoschuk/dns-switcher"
   echo
-
   local kprof kbkp
   kprof="$(kernel_profile_from_log)"; [[ -n "$kprof" ]] || kprof="-"
   kbkp="$(kernel_backup_from_log)"; [[ -n "$kbkp" ]] || kbkp="-"
-
   echo "🧩 Kernel tuning profile : ${kprof}"
   echo "🧳 Kernel backup dir     : ${kbkp}"
   echo "🔗 Repo tuning           : https://github.com/akadorkin/vps-network-tuning-script"
   echo
-
   echo "🧱 Limits"
   echo "  🧷 Conntrack max : $(conntrack_max)"
   echo "  📎 Nofile        : $(nofile_limit)"
   echo
-
   echo "👤 User"
   if [[ -n "${ARG_USER:-}" ]]; then
     echo "  🧑 Name     : ${ARG_USER}"
     if [[ "${USER_CREATED:-0}" == "1" ]]; then
       echo "  🔑 Password : ${USER_PASS}"
-      echo "  🛡️  Sudo     : NOPASSWD ✅"
-      echo "  🐳 Docker   : added to docker group ✅"
-      echo "  📁 /opt     : write access granted ✅"
     else
       echo "  🔑 Password : (unchanged)"
     fi
@@ -337,7 +326,6 @@ print_summary() {
     echo "  - (skipped)"
   fi
   echo
-
   echo "🧩 remnanode"
   if command -v docker >/dev/null 2>&1; then
     local st
@@ -345,31 +333,28 @@ print_summary() {
     if [[ -n "$st" ]]; then
       echo "  🐳 Container : ${st}"
       echo "  📄 Logs      : $(remnanode_log_health)"
-      echo "  📁 Compose   : /opt/remnanode/docker-compose.yml"
       echo
       echo "  🗂️  Logrotate policy (/etc/logrotate.d/remnanode):"
       remnanode_logrotate_policy
     else
-      echo "  - container not running (docker ps name=remnanode is empty)"
+      echo "  - container not running"
     fi
   else
     echo "  - docker not installed"
   fi
   echo
-
   echo "✅ Steps"
   echo "  🖥️  Hostname     : $([[ $S_HOSTNAME -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_HOSTNAME)")"
-  echo "  📦 Packages     : $([[ $S_APT -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_APT)")"
-  echo "  🌐 DNS switcher : $([[ $S_DNS -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_DNS)")"
-  echo "  🧠 Tailscale    : $([[ $S_TS -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_TS)")"
-  echo "  👤 User setup   : $([[ $S_USER -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_USER)")"
-  echo "  💅 Zsh          : $([[ $S_ZSH -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_ZSH)")"
-  echo "  🧠 Kernel tune  : $([[ $S_KERNEL -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_KERNEL)")"
-  echo "  🧱 UFW          : $([[ $S_UFW -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_UFW)")"
-  echo "  🔐 SSH/Fail2ban : $([[ $S_SSH -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_SSH)")"
-  echo "  🧩 remnanode    : $([[ $S_REMNA -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_REMNA)")"
+  echo "  📦 Packages      : $([[ $S_APT -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_APT)")"
+  echo "  🌐 DNS switcher  : $([[ $S_DNS -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_DNS)")"
+  echo "  🧠 Tailscale     : $([[ $S_TS -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_TS)")"
+  echo "  👤 User setup    : $([[ $S_USER -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_USER)")"
+  echo "  💅 Zsh           : $([[ $S_ZSH -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_ZSH)")"
+  echo "  🧠 Kernel tune   : $([[ $S_KERNEL -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_KERNEL)")"
+  echo "  🧱 UFW           : $([[ $S_UFW -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_UFW)")"
+  echo "  🔐 SSH/Fail2ban  : $([[ $S_SSH -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_SSH)")"
+  echo "  🧩 remnanode     : $([[ $S_REMNA -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_REMNA)")"
   echo
-
   echo "📄 Logs"
   echo "  🖥️  $L_HOSTNAME"
   echo "  📦 $L_APT"
@@ -391,7 +376,7 @@ Usage:
 Flags:
   --user <name>
   --timezone <TZ>              Default: Europe/Moscow
-  --reboot <ask|0|skip|5m|30s> Default: ask
+  --reboot <0|ask|5m|30s>      Default: 0
 
   --dns-switcher 0|1
   --tailscale 0|1
