@@ -36,12 +36,6 @@ need_root() {
   if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then return 0; fi
   die "Not root. Use: curl ... | sudo bash -s -- apply ..."
 }
-read_tty() {
-  local __var="$1" __prompt="$2" __v=""
-  [[ -t 0 ]] || { printf -v "$__var" '%s' ""; return 0; }
-  read -rp "$__prompt" __v </dev/tty || true
-  printf -v "$__var" '%s' "$__v"
-}
 
 # -------------------------- Args --------------------------
 CMD="${1:-}"; shift || true
@@ -52,7 +46,7 @@ ARG_REBOOT="0"
 
 ARG_TAILSCALE="0"
 ARG_DNS_SWITCHER="0"
-ARG_DNS_PROFILE=""        # empty => interactive upstream
+ARG_DNS_PROFILE=""        # if set 1..5 => fully non-interactive for DNS
 ARG_REMNANODE="0"
 ARG_SSH_HARDEN="0"
 ARG_OPEN_WAN_443="0"
@@ -68,6 +62,7 @@ while [[ $# -gt 0 ]]; do
     --remnanode=*)     ARG_REMNANODE="${1#*=}"; shift ;;
     --ssh-harden=*)    ARG_SSH_HARDEN="${1#*=}"; shift ;;
     --open-wan-443=*)  ARG_OPEN_WAN_443="${1#*=}"; shift ;;
+
     --user)          ARG_USER="${2:-}"; shift 2 ;;
     --timezone)      ARG_TIMEZONE="${2:-}"; shift 2 ;;
     --reboot)        ARG_REBOOT="${2:-}"; shift 2 ;;
@@ -77,12 +72,14 @@ while [[ $# -gt 0 ]]; do
     --remnanode)     ARG_REMNANODE="${2:-}"; shift 2 ;;
     --ssh-harden)    ARG_SSH_HARDEN="${2:-}"; shift 2 ;;
     --open-wan-443)  ARG_OPEN_WAN_443="${2:-}"; shift 2 ;;
+
     *) die "Unknown arg: $1" ;;
   esac
 done
 
 # -------------------------- URLs (assets) --------------------------
 ASSET_APT="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/apt-bootstrap.sh"
+ASSET_HOSTNAME="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/hostname-bootstrap.sh"
 ASSET_DNS="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/dns-bootstrap.sh"
 ASSET_KERNEL="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/kernel-bootstrap.sh"
 ASSET_TAILSCALE="https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/assests/tailscale-bootstrap.sh"
@@ -94,6 +91,7 @@ ASSET_REMNANODE="https://raw.githubusercontent.com/akadorkin/remnanode-install-s
 
 # -------------------------- Logs --------------------------
 LOG_DIR="/var/log"
+L_HOSTNAME="${LOG_DIR}/vps-edge-hostname.log"
 L_APT="${LOG_DIR}/vps-edge-apt.log"
 L_DNS="${LOG_DIR}/vps-edge-dns-switcher.log"
 L_TS="${LOG_DIR}/vps-edge-tailscale.log"
@@ -103,13 +101,13 @@ L_UFW="${LOG_DIR}/vps-edge-ufw.log"
 L_SSH="${LOG_DIR}/vps-edge-ssh.log"
 L_REMNA="${LOG_DIR}/vps-edge-remnanode.log"
 L_KERNEL="${LOG_DIR}/vps-edge-tuning.log"
-touch "$L_APT" "$L_DNS" "$L_TS" "$L_USER" "$L_ZSH" "$L_UFW" "$L_SSH" "$L_REMNA" "$L_KERNEL" 2>/dev/null || true
+touch "$L_HOSTNAME" "$L_APT" "$L_DNS" "$L_TS" "$L_USER" "$L_ZSH" "$L_UFW" "$L_SSH" "$L_REMNA" "$L_KERNEL" 2>/dev/null || true
 
 ASSETS_TMP="/tmp/vps-edge-assets"
 mkdir -p "$ASSETS_TMP"
 
 # statuses for summary
-S_APT=0 S_DNS=0 S_TS=0 S_USER=0 S_ZSH=0 S_UFW=0 S_SSH=0 S_REMNA=0 S_KERNEL=0
+S_HOSTNAME=0 S_APT=0 S_DNS=0 S_TS=0 S_USER=0 S_ZSH=0 S_UFW=0 S_SSH=0 S_REMNA=0 S_KERNEL=0
 USER_CREATED="0"
 USER_PASS=""
 
@@ -206,7 +204,7 @@ remnanode_logrotate_policy() {
   fi
 }
 
-# -------------------------- Asset runner --------------------------
+# -------------------------- Asset runner (verbose: console + log) --------------------------
 run_asset() {
   local name="$1" url="$2" log_file="$3"
   local tmp="${ASSETS_TMP}/${name}.sh"
@@ -221,55 +219,13 @@ run_asset() {
   chmod +x "$tmp" >>"$log_file" 2>&1 || true
 
   set +e
-  bash "$tmp" >>"$log_file" 2>&1
-  local rc=$?
+  # show everything live + write to log
+  bash "$tmp" 2>&1 | tee -a "$log_file"
+  local rc="${PIPESTATUS[0]}"
   set -e
 
   [[ $rc -eq 0 ]] && ok "${name} finished" || warn "${name} exited with code=${rc} (see ${log_file})"
   return "$rc"
-}
-
-# Same as run_asset but feeds stdin to asset
-run_asset_with_stdin() {
-  local name="$1" url="$2" log_file="$3" stdin_payload="$4"
-  local tmp="${ASSETS_TMP}/${name}.sh"
-
-  info "Running asset: ${name}"
-  : >"$log_file" || true
-
-  if ! curl -fsSL "$url" -o "$tmp" >>"$log_file" 2>&1; then
-    warn "${name} download failed: ${url}"
-    return 2
-  fi
-  chmod +x "$tmp" >>"$log_file" 2>&1 || true
-
-  set +e
-  # Feed stdin exactly (for upstream read -p etc.)
-  printf "%b" "$stdin_payload" | bash "$tmp" >>"$log_file" 2>&1
-  local rc=$?
-  set -e
-
-  [[ $rc -eq 0 ]] && ok "${name} finished" || warn "${name} exited with code=${rc} (see ${log_file})"
-  return "$rc"
-}
-
-# -------------------------- Hostname (interactive, early) --------------------------
-hostname_apply_interactive() {
-  [[ -t 0 ]] || return 0
-
-  local current new
-  current="$(hostnamectl --static 2>/dev/null || hostname)"
-
-  hdr "🖥️  Hostname"
-  echo "Current hostname : ${current}"
-  read_tty new "Enter new hostname (leave empty to keep current): "
-
-  if [[ -n "${new:-}" && "$new" != "$current" ]]; then
-    hostnamectl set-hostname "$new"
-    ok "Hostname changed to: $new"
-  else
-    info "Hostname unchanged"
-  fi
 }
 
 # -------------------------- Timezone --------------------------
@@ -291,6 +247,36 @@ maybe_reboot() {
     5m|5min|300)  warn "Reboot in 5 minutes";  shutdown -r +5   >/dev/null 2>&1 || shutdown -r now ;;
     *)            warn "Reboot in ${r}";        shutdown -r +"${r}" >/dev/null 2>&1 || shutdown -r now ;;
   esac
+}
+
+# -------------------------- Log dump (end) --------------------------
+dump_log_tail() {
+  local title="$1" path="$2" lines="${3:-160}"
+  echo
+  echo "==================== 📄 ${title} ===================="
+  echo "File: ${path}"
+  if [[ -s "$path" ]]; then
+    tail -n "$lines" "$path" || true
+  else
+    echo "(empty)"
+  fi
+  echo "===================================================="
+}
+
+dump_all_logs() {
+  hdr "📄 Logs (tail)"
+  echo "Tip: open full logs on server if needed (these are tails)."
+
+  dump_log_tail "hostname" "$L_HOSTNAME" 120
+  dump_log_tail "apt-bootstrap" "$L_APT" 160
+  dump_log_tail "dns-bootstrap" "$L_DNS" 220
+  dump_log_tail "tailscale-bootstrap" "$L_TS" 180
+  dump_log_tail "user-setup" "$L_USER" 220
+  dump_log_tail "zsh-bootstrap" "$L_ZSH" 160
+  dump_log_tail "kernel-bootstrap" "$L_KERNEL" 260
+  dump_log_tail "ufw-bootstrap" "$L_UFW" 220
+  dump_log_tail "ssh-bootstrap" "$L_SSH" 220
+  dump_log_tail "remnanode-bootstrap" "$L_REMNA" 220
 }
 
 # -------------------------- Summary (final) --------------------------
@@ -382,33 +368,35 @@ print_summary() {
   echo
 
   echo "✅ Steps"
+  echo "  🖥️  Hostname     : $([[ $S_HOSTNAME -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_HOSTNAME)")"
   echo "  📦 Packages     : $([[ $S_APT -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_APT)")"
   echo "  🌐 DNS switcher : $([[ $S_DNS -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_DNS)")"
   echo "  🧠 Tailscale    : $([[ $S_TS -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_TS)")"
   echo "  👤 User setup   : $([[ $S_USER -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_USER)")"
   echo "  💅 Zsh          : $([[ $S_ZSH -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_ZSH)")"
+  echo "  🧠 Kernel tune  : $([[ $S_KERNEL -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_KERNEL)")"
   echo "  🧱 UFW          : $([[ $S_UFW -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_UFW)")"
   echo "  🔐 SSH/Fail2ban : $([[ $S_SSH -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_SSH)")"
   echo "  🧩 remnanode    : $([[ $S_REMNA -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_REMNA)")"
-  echo "  🧠 Kernel tune  : $([[ $S_KERNEL -eq 0 ]] && echo 'OK' || echo "WARN (rc=$S_KERNEL)")"
   echo
 
-  echo "📄 Logs"
+  echo "📄 Log files"
+  echo "  🖥️  $L_HOSTNAME"
   echo "  📦 $L_APT"
   echo "  🌐 $L_DNS"
   echo "  🧠 $L_TS"
   echo "  👤 $L_USER"
   echo "  💅 $L_ZSH"
+  echo "  🧠 $L_KERNEL"
   echo "  🧱 $L_UFW"
   echo "  🔐 $L_SSH"
   echo "  🧩 $L_REMNA"
-  echo "  🧠 $L_KERNEL"
 }
 
 usage() {
   cat <<'EOF'
 Usage:
-  sudo ./vps-edge-run.sh apply [flags]
+  curl -fsSL https://raw.githubusercontent.com/akadorkin/remnanode-install-script/main/vps-edge-run.sh | sudo bash -s -- apply [flags]
 
 Flags:
   --user <name>
@@ -416,7 +404,7 @@ Flags:
   --reboot <0|skip|5m|30s|...> Default: 0 (no reboot)
 
   --dns-switcher 0|1
-  --dns-profile 1..5           If set and dns-switcher=1 => auto-feed "y + profile"
+  --dns-profile 1..5           If set and dns-switcher=1 => fully non-interactive for DNS
   --tailscale 0|1
   --remnanode 0|1
   --ssh-harden 0|1
@@ -428,7 +416,14 @@ EOF
 apply_cmd() {
   need_root "$@"
 
-  hostname_apply_interactive
+  # Hostname (interactive-only; if no /dev/tty -> asset will fail and log why)
+  hdr "🖥️  Hostname"
+  if run_asset "hostname-bootstrap" "$ASSET_HOSTNAME" "$L_HOSTNAME"; then
+    S_HOSTNAME=0
+  else
+    S_HOSTNAME=$?
+  fi
+
   timezone_apply
 
   hdr "🏁 Start"
@@ -442,16 +437,14 @@ apply_cmd() {
   # DNS
   if [[ "${ARG_DNS_SWITCHER}" == "1" ]]; then
     hdr "🌐 DNS switcher"
-    # If dns-profile provided -> auto-feed y + profile into the asset (no prompts)
+    # Non-interactive path: pass DNS_PROFILE env to dns asset (it must honor it)
     if [[ -n "${ARG_DNS_PROFILE:-}" && "${ARG_DNS_PROFILE}" =~ ^[1-5]$ ]]; then
-      if run_asset_with_stdin "dns-bootstrap" "$ASSET_DNS" "$L_DNS" $'y\n'"${ARG_DNS_PROFILE}"$'\n'; then
-        S_DNS=0
-      else
-        S_DNS=$?
-      fi
+      export DNS_PROFILE="${ARG_DNS_PROFILE}"
+      if run_asset "dns-bootstrap" "$ASSET_DNS" "$L_DNS"; then S_DNS=0; else S_DNS=$?; fi
       ok "dns-switcher auto-applied (profile ${ARG_DNS_PROFILE}) (see $L_DNS)"
     else
-      # No profile -> let user interact with upstream normally
+      unset DNS_PROFILE || true
+      warn "dns-profile not provided -> DNS step will be interactive (TTY required)."
       if run_asset "dns-bootstrap" "$ASSET_DNS" "$L_DNS"; then S_DNS=0; else S_DNS=$?; fi
       ok "dns-switcher applied (interactive) (see $L_DNS)"
     fi
@@ -496,7 +489,6 @@ apply_cmd() {
   if [[ "${ARG_OPEN_WAN_443}" == "1" || "${ARG_TAILSCALE}" == "1" ]]; then
     hdr "🧱 UFW"
     export OPEN_WAN_443="${ARG_OPEN_WAN_443}"
-    export ENABLE_TAILSCALE="${ARG_TAILSCALE}"
     if run_asset "ufw-bootstrap" "$ASSET_UFW" "$L_UFW"; then S_UFW=0; else S_UFW=$?; fi
   fi
 
@@ -512,7 +504,10 @@ apply_cmd() {
     if run_asset "remnanode-bootstrap" "$ASSET_REMNANODE" "$L_REMNA"; then S_REMNA=0; else S_REMNA=$?; fi
   fi
 
+  # Final: summary + logs
   print_summary
+  dump_all_logs
+
   maybe_reboot
 }
 
