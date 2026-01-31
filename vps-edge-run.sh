@@ -746,14 +746,27 @@ tailscale_up_with_auth() {
   local out="/tmp/vps-edge-tailscale-up.log"
   rm -f "$out" 2>/dev/null || true
 
+  # Force fresh login flow so we reliably get an auth URL.
+  tailscale logout >>"$TS_LOG" 2>&1 || true
+
   set +e
   tailscale up --ssh 2>&1 | tee "$out" >>"$TS_LOG"
   local rc=${PIPESTATUS[0]}
   set -e
 
-  # Try to extract auth URL (when not logged in)
   local url=""
   url="$(grep -Eo 'https://login\.tailscale\.com/[a-zA-Z0-9/_-]+' "$out" | head -n1 || true)"
+
+  # If tailscale up didn't print the URL, tailscale login usually will.
+  if [[ -z "$url" ]]; then
+    rm -f "$out" 2>/dev/null || true
+    set +e
+    tailscale login 2>&1 | tee "$out" >>"$TS_LOG"
+    rc_login=${PIPESTATUS[0]}
+    set -e
+    url="$(grep -Eo 'https://login\.tailscale\.com/[a-zA-Z0-9/_-]+' "$out" | head -n1 || true)"
+    rc=$(( rc == 0 ? rc_login : rc ))
+  fi
 
   if [[ -n "$url" ]]; then
     echo
@@ -765,6 +778,14 @@ tailscale_up_with_auth() {
     else
       warn "No /dev/tty available to wait for confirmation."
     fi
+
+    # After approval, ensure we're up with ssh enabled.
+    set +e
+    tailscale up --ssh >>"$TS_LOG" 2>&1
+    set -e
+  else
+    warn "Could not extract Tailscale auth URL."
+    warn "Try manually: tailscale logout && tailscale login"
   fi
 
   return "$rc"
