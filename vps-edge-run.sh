@@ -232,7 +232,7 @@ rollback(){
 
   runq "sysctl --system" sysctl --system || true
   runq "systemd daemon-reexec" systemctl daemon-reexec || true
-  runq "restart ssh/sshd" (systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true || true
+  runq "restart ssh/sshd" bash -lc "systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true" || true
 
   # UFW: disable then enable to refresh rules (best-effort)
   if have_cmd ufw; then
