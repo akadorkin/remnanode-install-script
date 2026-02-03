@@ -864,13 +864,17 @@ flag_from_country() {
   local cc="${1:-}"
   [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || { echo ""; return 0; }
   cc="$(echo "$cc" | tr '[:lower:]' '[:upper:]')"
-  local a b
+
+  local a b code1 code2 esc
   a="${cc:0:1}"
   b="${cc:1:1}"
-  # IMPORTANT: one backslash so bash printf emits real unicode char, not "\U...." text
-  printf "\U%08X\U%08X" \
-    "$(( 127462 + $(printf '%d' "'$a") - 65 ))" \
-    "$(( 127462 + $(printf '%d' "'$b") - 65 ))"
+
+  code1=$(( 127462 + $(printf '%d' "'$a") - 65 ))
+  code2=$(( 127462 + $(printf '%d' "'$b") - 65 ))
+
+  # Build literal \Uxxxxxxxx escapes, then expand them via %b
+  printf -v esc '\\U%08X\\U%08X' "$code1" "$code2"
+  printf '%b' "$esc"
 }
 
 remna_status() {
