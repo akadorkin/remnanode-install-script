@@ -116,6 +116,7 @@ done
 # OUTPUT HELPERS
 ###############################################################################
 _is_tty() { [[ -t 0 && -t 1 ]]; }
+_has_tty() { [[ -r /dev/tty && -w /dev/tty ]]; }
 
 c_reset=$'\033[0m'
 c_bold=$'\033[1m'
@@ -304,14 +305,19 @@ fi
 pick_open_ports
 
 ###############################################################################
-# REMNANODE: ASK EARLY
+# REMNANODE: ASK EARLY (interactive even with curl|bash via /dev/tty)
 ###############################################################################
 if [[ "${REMNANODE}" == "1" ]]; then
   log "remnanode=1 -> requesting parameters"
-  if _is_tty; then
+
+  NODE_PORT="${NODE_PORT:-2222}"
+
+  if _has_tty; then
     read_tty NODE_PORT "Enter NODE_PORT for remnanode (default: 2222): "
     [[ -n "${NODE_PORT}" ]] || NODE_PORT="2222"
     read_tty_silent SECRET_KEY "Paste SECRET_KEY (input hidden): "
+  else
+    warn "/dev/tty is not available — cannot prompt for remnanode parameters"
   fi
 
   [[ -n "${NODE_PORT:-}" ]] || NODE_PORT="2222"
