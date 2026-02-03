@@ -867,7 +867,8 @@ flag_from_country() {
   local a b
   a="${cc:0:1}"
   b="${cc:1:1}"
-  printf "\\U%08X\\U%08X" \
+  # IMPORTANT: one backslash so bash printf emits real unicode char, not "\U...." text
+  printf "\U%08X\U%08X" \
     "$(( 127462 + $(printf '%d' "'$a") - 65 ))" \
     "$(( 127462 + $(printf '%d' "'$b") - 65 ))"
 }
