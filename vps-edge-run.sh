@@ -3,10 +3,13 @@ set -Eeuo pipefail
 
 ###############################################################################
 # VPS bootstrap (user + docker + tailscale + ufw + fail2ban + dns switcher)
-# - Interactive port picker (no hardcode required)
-# - Tailscale (optional): detect already-auth + already-running; otherwise run `tailscale up`
-# - Fail2ban: sshd + sshd-fast + recidive (NO sshd-ddos dependency)
-# - DNS switcher: overwrites /etc/systemd/resolved.conf (as requested)
+# - Hostname prompt works even with curl|bash (via /dev/tty)
+# - SSHD hardening: Port + PermitRootLogin no + PasswordAuthentication no
+# - SSH keys: copy authorized_keys from root (preferred) or ubuntu (fallback)
+# - User password: generated AND printed when user is created (also saved to /root/initial-user-password.txt)
+# - UFW opens TCP+UDP for selected ports (OK)
+# - node_exporter is linux-amd64 only (OK)
+# - DNS switcher overwrites /etc/systemd/resolved.conf (OK)
 # - Network tuning: calls external script (your repo)
 #
 # Flags:
@@ -66,14 +69,14 @@ Options:
   --ports ask|skip | --ports=ask|skip                (default: ask if TTY, else skip)
   --open-ports "<list>" | --open-ports="<list>"      comma/space-separated ports
 
-  --tuning 0|1 | --tuning=0|1                         (default: 1)
+  --tuning 0|1 | --tuning=0|1                        (default: 1)
 
-  --dns-switch 0|1 | --dns-switch=0|1                 (default: 1)
-  --dns-profile 1..5 | --dns-profile=1..5             (default: auto)
-  --dns-custom "<servers>"                             (for --dns-profile 5)
-  --dns-fallback "<server>"                            (for --dns-profile 5; default: 9.9.9.9)
+  --dns-switch 0|1 | --dns-switch=0|1                (default: 1)
+  --dns-profile 1..5 | --dns-profile=1..5            (default: auto)
+  --dns-custom "<servers>"                           (for --dns-profile 5)
+  --dns-fallback "<server>"                          (for --dns-profile 5; default: 9.9.9.9)
 
-  --tailscale 0|1 | --tailscale=0|1                   (default: 0)
+  --tailscale 0|1 | --tailscale=0|1                  (default: 0)
 EOF
 }
 
@@ -193,6 +196,46 @@ get_sshd_effective() {
   fi
 }
 
+restart_ssh_service() {
+  if systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.service'; then
+    systemctl restart ssh >/dev/null 2>&1 || true
+  elif systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx 'sshd.service'; then
+    systemctl restart sshd >/dev/null 2>&1 || true
+  else
+    systemctl restart ssh >/dev/null 2>&1 || true
+    systemctl restart sshd >/dev/null 2>&1 || true
+  fi
+}
+
+harden_sshd() {
+  log "SSHD hardening (Port=${SSH_PORT}, PermitRootLogin=no, PasswordAuthentication=no)"
+  local drop_dir="/etc/ssh/sshd_config.d"
+  mkdir -p "$drop_dir"
+
+  # Safer to use a drop-in on modern Ubuntu/Debian.
+  install -m 0644 /dev/stdin "${drop_dir}/99-initial-hardening.conf" <<EOF_SSHD_DROP
+# Managed by initial.sh
+Port ${SSH_PORT}
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PubkeyAuthentication yes
+EOF_SSHD_DROP
+
+  # Validate config before restart (avoid locking ourselves out due to syntax errors).
+  if command -v sshd >/dev/null 2>&1; then
+    if sshd -t >/dev/null 2>&1; then
+      restart_ssh_service
+      ok "SSHD config applied and service restarted"
+    else
+      warn "sshd -t failed; not restarting SSH. Check: ${drop_dir}/99-initial-hardening.conf"
+    fi
+  else
+    warn "sshd binary not found; skipping SSH restart"
+  fi
+}
+
 ###############################################################################
 # PORTS PICKER
 ###############################################################################
@@ -215,6 +258,15 @@ _ports_sanitize_to_array() {
     fi
   done
   OPEN_PORTS=("${dedup[@]}")
+}
+
+ensure_port_in_open_ports() {
+  local need="$1" p
+  for p in "${OPEN_PORTS[@]}"; do
+    [[ "$p" == "$need" ]] && return 0
+  done
+  OPEN_PORTS+=("$need")
+  warn "SSH port ${need} was not in open ports list; added to OPEN_PORTS to avoid lockout."
 }
 
 pick_open_ports() {
@@ -275,7 +327,7 @@ export NEEDRESTART_MODE=a
 log "Parameters: user='${USER_NAME:-<ask>}' timezone='${TIMEZONE}' reboot='${REBOOT_DELAY}' remnanode='${REMNANODE}' ssh_port='${SSH_PORT}' tuning='${RUN_TUNING}' dns-switch='${RUN_DNS_SWITCH}' dns-profile='${DNS_PROFILE:-<auto>}' tailscale='${RUN_TAILSCALE}'"
 
 if [[ -z "${USER_NAME}" ]]; then
-  if _is_tty; then
+  if _has_tty; then
     read_tty USER_NAME "Enter username to create (e.g., akadorkin): "
   fi
   [[ -n "$USER_NAME" ]] || { err "Username is empty (provide --user)"; exit 1; }
@@ -284,12 +336,12 @@ ok "User: $USER_NAME"
 HOME_DIR="/home/${USER_NAME}"
 
 ###############################################################################
-# STEP 0: HOSTNAME (interactive if TTY)
+# STEP 0: HOSTNAME (interactive even with curl|bash via /dev/tty)
 ###############################################################################
 log "Step 0: hostname"
 CURRENT_HOST="$(hostname 2>/dev/null || true)"
 NEW_HOST=""
-if _is_tty; then
+if _has_tty; then
   read_tty NEW_HOST "Enter hostname (press Enter to keep '${CURRENT_HOST}'): "
 fi
 if [[ -n "${NEW_HOST:-}" ]]; then
@@ -303,6 +355,7 @@ fi
 # PORTS
 ###############################################################################
 pick_open_ports
+ensure_port_in_open_ports "${SSH_PORT}"
 
 ###############################################################################
 # REMNANODE: ASK EARLY (interactive even with curl|bash via /dev/tty)
@@ -414,12 +467,16 @@ fi
 ###############################################################################
 log "User and SSH setup"
 PASS_GEN=""
+PASS_FILE="/root/initial-user-password.txt"
+PASS_CREATED="0"
+
 if id -u "${USER_NAME}" >/dev/null 2>&1; then
   ok "User ${USER_NAME} exists — not creating"
 else
   PASS_GEN="$(openssl rand -base64 16)"
   runq "useradd ${USER_NAME}" useradd -m -s /usr/bin/zsh "${USER_NAME}"
   runq "set user password" bash -lc "echo '${USER_NAME}:${PASS_GEN}' | chpasswd"
+  PASS_CREATED="1"
   ok "Created user ${USER_NAME}"
 fi
 
@@ -430,6 +487,7 @@ install -m 0440 /dev/stdin "/etc/sudoers.d/${USER_NAME}" <<EOF_SUDO
 ${USER_NAME} ALL=(ALL) NOPASSWD:ALL
 EOF_SUDO
 
+# SSH keys: copy from root (preferred) or ubuntu (fallback)
 runq "mkdir ~/.ssh" mkdir -p "${HOME_DIR}/.ssh"
 runq "chmod 700 ~/.ssh" chmod 700 "${HOME_DIR}/.ssh"
 
@@ -443,9 +501,27 @@ fi
 if [[ -n "$AUTH_SRC" ]]; then
   runq "copy authorized_keys from ${AUTH_SRC}" install -m 0600 "$AUTH_SRC" "${HOME_DIR}/.ssh/authorized_keys"
   runq "chown ~/.ssh" chown -R "${USER_NAME}:${USER_NAME}" "${HOME_DIR}/.ssh"
+  ok "SSH keys copied -> ${HOME_DIR}/.ssh/authorized_keys"
 else
   warn "authorized_keys not found for root or ubuntu — SSH keys were NOT copied to ${USER_NAME}"
 fi
+
+# Print password ONLY if user was created now
+if [[ "${PASS_CREATED}" == "1" ]]; then
+  echo
+  echo "============================================================"
+  echo " 🔐 New user credentials"
+  echo "============================================================"
+  echo "  User:     ${USER_NAME}"
+  echo "  Password: ${PASS_GEN}"
+  echo
+  printf "%s:%s\n" "${USER_NAME}" "${PASS_GEN}" > "${PASS_FILE}"
+  chmod 600 "${PASS_FILE}" || true
+  ok "Saved credentials to: ${PASS_FILE} (root-only)"
+fi
+
+# SSHD hardening AFTER keys are in place
+harden_sshd
 
 ###############################################################################
 # REMNANODE COMPOSE
@@ -516,7 +592,7 @@ ensure_tailscale_up() {
     warn "Authorization URL not found (maybe already authorized)."
   fi
 
-  if _is_tty; then
+  if _has_tty; then
     local _=""
     read_tty _ "Press Enter after authorizing this device in Tailscale..."
   fi
@@ -856,14 +932,20 @@ tailscale_magicdns_full() {
   fi
 }
 
-external_ip() {
-  curl -fsSL ifconfig.me 2>/dev/null || curl -fsSL https://api.ipify.org 2>/dev/null || true
+external_ip4() {
+  curl -4 -fsSL ifconfig.me 2>/dev/null || curl -4 -fsSL https://api.ipify.org 2>/dev/null || true
 }
 
 ip_identity() {
   local ip="$1"
   [[ -n "$ip" ]] || { echo ""; return 0; }
   curl -fsSL "https://ipinfo.io/${ip}/json" 2>/dev/null || true
+}
+
+iface_ipv4() {
+  local ifc="${1:-}"
+  [[ -n "$ifc" ]] || { echo ""; return 0; }
+  ip -4 -o addr show dev "$ifc" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true
 }
 
 flag_from_country() {
@@ -878,7 +960,6 @@ flag_from_country() {
   code1=$(( 127462 + $(printf '%d' "'$a") - 65 ))
   code2=$(( 127462 + $(printf '%d' "'$b") - 65 ))
 
-  # Build literal \Uxxxxxxxx escapes, then expand them via %b
   printf -v esc '\\U%08X\\U%08X' "$code1" "$code2"
   printf '%b' "$esc"
 }
@@ -929,8 +1010,9 @@ SSH_ROOT_LOGIN="$(get_sshd_effective PermitRootLogin)"
 F2B_JAILS="$(fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:\s*//p' | tr -d '\r' || true)"
 [[ -z "${F2B_JAILS:-}" ]] && F2B_JAILS="(unknown)"
 
-EXT_IP="$(external_ip || true)"; [[ -z "$EXT_IP" ]] && EXT_IP="unknown"
-IP_JSON="$(ip_identity "$EXT_IP" || true)"
+EXT_IP4="$(external_ip4 || true)"; [[ -z "$EXT_IP4" ]] && EXT_IP4="unknown"
+IFACE_IP4="$(iface_ipv4 "${INTERNET_IFACE:-}" || true)"
+IP_JSON="$(ip_identity "$EXT_IP4" || true)"
 CC="$(echo "$IP_JSON" | jq -r '.country // empty' 2>/dev/null || true)"
 CITY="$(echo "$IP_JSON" | jq -r '.city // empty' 2>/dev/null || true)"
 REGION="$(echo "$IP_JSON" | jq -r '.region // empty' 2>/dev/null || true)"
@@ -954,6 +1036,7 @@ echo "============================================================"
 
 hdr "🔥 Ports"
 echo "  Interface:           ${INTERNET_IFACE:-unknown}"
+[[ -n "${IFACE_IP4:-}" ]] && echo "  Interface IPv4:      ${IFACE_IP4}" || echo "  Interface IPv4:      (none)"
 echo "  Open ports:          ${OPEN_PORTS[*]}"
 
 hdr "🔥 Firewall (UFW)"
@@ -989,14 +1072,14 @@ echo "  Docker:              /var/log/install-docker.log"
 echo "  Tailscale:           /var/log/install-tailscale.log"
 
 hdr "🌐 Network identity"
-if [[ "$EXT_IP" != "unknown" ]]; then
-  echo "  External IP:         ${EXT_IP} ${FLAG}"
+if [[ "$EXT_IP4" != "unknown" ]]; then
+  echo "  External IPv4:       ${EXT_IP4} ${FLAG}"
   if [[ -n "${CITY}${REGION}${CC}" ]]; then
     echo "  Location:            ${CITY}${CITY:+, }${REGION}${REGION:+, }${CC}"
   fi
   [[ -n "$ORG" ]] && echo "  Provider/ASN:        ${ORG}"
 else
-  echo "  External IP:         unknown"
+  echo "  External IPv4:       unknown"
 fi
 
 hdr "🛡️ Tailscale"
@@ -1011,6 +1094,6 @@ hdr "🧾 System summary"
 sys_summary
 
 hdr "▶️ Run again"
-echo "  sudo bash initial.sh --user=${USER_NAME} --timezone=${TIMEZONE} --remnanode=${REMNANODE} --reboot=0 --tailscale=${RUN_TAILSCALE} --dns-switch=${RUN_DNS_SWITCH} --dns-profile=${DNS_PROFILE:-1}"
+echo "  sudo bash initial.sh --user=${USER_NAME} --timezone=${TIMEZONE} --remnanode=${REMNANODE} --reboot=0 --tailscale=${RUN_TAILSCALE} --dns-switch=${RUN_DNS_SWITCH} --dns-profile=${DNS_PROFILE:-1} --ssh-port=${SSH_PORT} --open-ports=\"${OPEN_PORTS[*]}\""
 
 exit 0
