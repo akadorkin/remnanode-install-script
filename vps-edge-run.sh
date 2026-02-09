@@ -11,6 +11,7 @@ set -Eeuo pipefail
 # - node_exporter is linux-amd64 only (OK)
 # - DNS switcher overwrites /etc/systemd/resolved.conf (OK)
 # - Network tuning: calls external script (your repo)
+# - ZSH stack: zsh + oh-my-zsh + p10k + fzf + plugins (from your working script)
 #
 # Flags:
 #   --user <name>              required if non-interactive
@@ -212,7 +213,6 @@ harden_sshd() {
   local drop_dir="/etc/ssh/sshd_config.d"
   mkdir -p "$drop_dir"
 
-  # Safer to use a drop-in on modern Ubuntu/Debian.
   install -m 0644 /dev/stdin "${drop_dir}/99-initial-hardening.conf" <<EOF_SSHD_DROP
 # Managed by initial.sh
 Port ${SSH_PORT}
@@ -223,7 +223,6 @@ ChallengeResponseAuthentication no
 PubkeyAuthentication yes
 EOF_SSHD_DROP
 
-  # Validate config before restart (avoid locking ourselves out due to syntax errors).
   if command -v sshd >/dev/null 2>&1; then
     if sshd -t >/dev/null 2>&1; then
       restart_ssh_service
@@ -318,71 +317,6 @@ pick_open_ports() {
 }
 
 ###############################################################################
-# START
-###############################################################################
-require_root
-export DEBIAN_FRONTEND=noninteractive
-export NEEDRESTART_MODE=a
-
-log "Parameters: user='${USER_NAME:-<ask>}' timezone='${TIMEZONE}' reboot='${REBOOT_DELAY}' remnanode='${REMNANODE}' ssh_port='${SSH_PORT}' tuning='${RUN_TUNING}' dns-switch='${RUN_DNS_SWITCH}' dns-profile='${DNS_PROFILE:-<auto>}' tailscale='${RUN_TAILSCALE}'"
-
-if [[ -z "${USER_NAME}" ]]; then
-  if _has_tty; then
-    read_tty USER_NAME "Enter username to create (e.g., akadorkin): "
-  fi
-  [[ -n "$USER_NAME" ]] || { err "Username is empty (provide --user)"; exit 1; }
-fi
-ok "User: $USER_NAME"
-HOME_DIR="/home/${USER_NAME}"
-
-###############################################################################
-# STEP 0: HOSTNAME (interactive even with curl|bash via /dev/tty)
-###############################################################################
-log "Step 0: hostname"
-CURRENT_HOST="$(hostname 2>/dev/null || true)"
-NEW_HOST=""
-if _has_tty; then
-  read_tty NEW_HOST "Enter hostname (press Enter to keep '${CURRENT_HOST}'): "
-fi
-if [[ -n "${NEW_HOST:-}" ]]; then
-  runq "hostnamectl set-hostname" hostnamectl set-hostname "${NEW_HOST}" || true
-  ok "Hostname set to: ${NEW_HOST}"
-else
-  ok "Hostname unchanged: ${CURRENT_HOST}"
-fi
-
-###############################################################################
-# PORTS
-###############################################################################
-pick_open_ports
-ensure_port_in_open_ports "${SSH_PORT}"
-
-###############################################################################
-# REMNANODE: ASK EARLY (interactive even with curl|bash via /dev/tty)
-###############################################################################
-if [[ "${REMNANODE}" == "1" ]]; then
-  log "remnanode=1 -> requesting parameters"
-
-  NODE_PORT="${NODE_PORT:-2222}"
-
-  if _has_tty; then
-    read_tty NODE_PORT "Enter NODE_PORT for remnanode (default: 2222): "
-    [[ -n "${NODE_PORT}" ]] || NODE_PORT="2222"
-    read_tty_silent SECRET_KEY "Paste SECRET_KEY (input hidden): "
-  else
-    warn "/dev/tty is not available — cannot prompt for remnanode parameters"
-  fi
-
-  [[ -n "${NODE_PORT:-}" ]] || NODE_PORT="2222"
-  if [[ -z "${SECRET_KEY:-}" ]]; then
-    err "SECRET_KEY is empty — remnanode compose will not be created"
-    REMNANODE="0"
-  else
-    ok "remnanode parameters received"
-  fi
-fi
-
-###############################################################################
 # FD LIMITS
 ###############################################################################
 apply_fd_limits() {
@@ -424,6 +358,223 @@ aptq() {
   fi
 }
 
+###############################################################################
+# ZSH STACK (from your working script)
+###############################################################################
+zsh_stack_for_user() {
+  local user="$1"
+  local home_dir="$2"
+
+  log "Zsh stack for ${user}: oh-my-zsh + p10k + fzf + plugins"
+
+  # Ensure zsh path in /etc/shells for chsh
+  grep -q '^/usr/bin/zsh$' /etc/shells || echo '/usr/bin/zsh' >> /etc/shells
+
+  # oh-my-zsh (non-interactive)
+  if [[ ! -d "${home_dir}/.oh-my-zsh" ]]; then
+    runq "oh-my-zsh install (${user})" su - "${user}" -c \
+      'RUNZSH=no KEEP_ZSHRC=yes CHSH=no sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"'
+  else
+    ok "oh-my-zsh already exists for ${user}"
+  fi
+
+  local zsh_path="${home_dir}/.oh-my-zsh"
+  local zsh_custom="${zsh_path}/custom"
+
+  runq "mkdir OMZ custom dirs (${user})" su - "${user}" -c "mkdir -p ${zsh_custom}/plugins ${zsh_custom}/themes"
+
+  if [[ ! -d "${zsh_custom}/plugins/zsh-autosuggestions" ]]; then
+    runq "plugin zsh-autosuggestions (${user})" su - "${user}" -c \
+      "git clone --depth=1 https://github.com/zsh-users/zsh-autosuggestions ${zsh_custom}/plugins/zsh-autosuggestions"
+  fi
+  if [[ ! -d "${zsh_custom}/plugins/zsh-completions" ]]; then
+    runq "plugin zsh-completions (${user})" su - "${user}" -c \
+      "git clone --depth=1 https://github.com/zsh-users/zsh-completions ${zsh_custom}/plugins/zsh-completions"
+  fi
+  if [[ ! -d "${zsh_custom}/plugins/zsh-syntax-highlighting" ]]; then
+    runq "plugin zsh-syntax-highlighting (${user})" su - "${user}" -c \
+      "git clone --depth=1 https://github.com/zsh-users/zsh-syntax-highlighting ${zsh_custom}/plugins/zsh-syntax-highlighting"
+  fi
+  if [[ ! -d "${zsh_custom}/themes/powerlevel10k" ]]; then
+    runq "theme powerlevel10k (${user})" su - "${user}" -c \
+      "git clone --depth=1 https://github.com/romkatv/powerlevel10k.git ${zsh_custom}/themes/powerlevel10k"
+  fi
+
+  # fzf
+  if [[ ! -d "${home_dir}/.fzf" ]]; then
+    runq "fzf clone (${user})" su - "${user}" -c 'git clone --depth 1 https://github.com/junegunn/fzf.git ~/.fzf'
+    runq "fzf install (${user})" su - "${user}" -c 'yes | ~/.fzf/install --key-bindings --completion --no-bash --no-fish --no-update-rc'
+  else
+    ok "fzf already exists for ${user}"
+  fi
+
+  # download your dotfiles
+  runq "download .zshrc (${user})"   curl -fsSL "https://kadorkin.io/zshrc" -o "${home_dir}/.zshrc"
+  runq "download .p10k (${user})"    curl -fsSL "https://kadorkin.io/p10k"  -o "${home_dir}/.p10k.zsh"
+  runq "chown zsh dotfiles (${user})" chown "${user}:${user}" "${home_dir}/.zshrc" "${home_dir}/.p10k.zsh"
+
+  # fzf fallback block in .zshrc if missing
+  if [[ -f "${home_dir}/.zshrc" ]] && ! grep -q 'FZF_BASE=' "${home_dir}/.zshrc"; then
+    cat >> "${home_dir}/.zshrc" <<'EOF_FZF'
+# Linux fallback for oh-my-zsh fzf plugin
+if command -v fzf >/dev/null 2>&1; then
+  export FZF_BASE="${FZF_BASE:-$HOME/.fzf}"
+fi
+EOF_FZF
+    runq "chown .zshrc (${user})" chown "${user}:${user}" "${home_dir}/.zshrc"
+  fi
+
+  # disable OMZ updates/prompts
+  for zrc in "${home_dir}/.zshrc"; do
+    [[ -f "$zrc" ]] || continue
+    if ! grep -q 'DISABLE_AUTO_UPDATE' "$zrc" 2>/dev/null; then
+      echo 'DISABLE_AUTO_UPDATE="true"' >> "$zrc"
+    fi
+    if ! grep -q 'DISABLE_UPDATE_PROMPT' "$zrc" 2>/dev/null; then
+      echo 'DISABLE_UPDATE_PROMPT=true' >> "$zrc"
+    fi
+    if ! grep -q ":omz:update" "$zrc" 2>/dev/null; then
+      echo "zstyle ':omz:update' mode disabled" >> "$zrc"
+    fi
+    chown "${user}:${user}" "$zrc" || true
+  done
+
+  ok "Zsh stack ready for ${user}"
+}
+
+zsh_stack_for_root() {
+  local user_home="$1"   # from created user (to copy from)
+  local root_home="/root"
+
+  log "Zsh stack for root"
+
+  # copy omz from user if possible (faster and more consistent)
+  if [[ -d "${user_home}/.oh-my-zsh" && ! -d "${root_home}/.oh-my-zsh" ]]; then
+    log "Copying oh-my-zsh from user to root"
+    cp -a "${user_home}/.oh-my-zsh" "${root_home}/.oh-my-zsh"
+    chown -R root:root "${root_home}/.oh-my-zsh" || true
+  fi
+
+  if [[ ! -d "${root_home}/.oh-my-zsh" ]]; then
+    log "Installing oh-my-zsh for root"
+    if RUNZSH=no KEEP_ZSHRC=yes CHSH=no \
+         sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"; then
+      ok "oh-my-zsh installed for root"
+    else
+      warn "oh-my-zsh install (root) failed — continuing without it"
+    fi
+  else
+    ok "oh-my-zsh already exists for root"
+  fi
+
+  # fzf for root
+  if [[ ! -d "${root_home}/.fzf" ]]; then
+    log "Installing fzf for root"
+    runq "fzf clone (root)" git clone --depth 1 https://github.com/junegunn/fzf.git "${root_home}/.fzf"
+    runq "fzf install (root)" bash -lc 'yes | ~/.fzf/install --key-bindings --completion --no-bash --no-fish --no-update-rc'
+  else
+    ok "fzf already exists for root"
+  fi
+
+  # copy dotfiles from user if present
+  if [[ -f "${user_home}/.zshrc" ]]; then
+    runq "copy .zshrc to root" cp "${user_home}/.zshrc" "${root_home}/.zshrc"
+    chown root:root "${root_home}/.zshrc" || true
+  fi
+  if [[ -f "${user_home}/.p10k.zsh" ]]; then
+    runq "copy .p10k.zsh to root" cp "${user_home}/.p10k.zsh" "${root_home}/.p10k.zsh"
+    chown root:root "${root_home}/.p10k.zsh" || true
+  fi
+
+  # disable OMZ updates/prompts for root
+  for zrc in "${root_home}/.zshrc"; do
+    [[ -f "$zrc" ]] || continue
+    if ! grep -q 'DISABLE_AUTO_UPDATE' "$zrc" 2>/dev/null; then
+      echo 'DISABLE_AUTO_UPDATE="true"' >> "$zrc"
+    fi
+    if ! grep -q 'DISABLE_UPDATE_PROMPT' "$zrc" 2>/dev/null; then
+      echo 'DISABLE_UPDATE_PROMPT=true' >> "$zrc"
+    fi
+    if ! grep -q ":omz:update" "$zrc" 2>/dev/null; then
+      echo "zstyle ':omz:update' mode disabled" >> "$zrc"
+    fi
+    chown root:root "$zrc" || true
+  done
+
+  # set zsh for root (non-fatal)
+  chsh -s /usr/bin/zsh root >/dev/null 2>&1 || true
+
+  ok "Root zsh stack ready"
+}
+
+###############################################################################
+# START
+###############################################################################
+require_root
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+
+log "Parameters: user='${USER_NAME:-<ask>}' timezone='${TIMEZONE}' reboot='${REBOOT_DELAY}' remnanode='${REMNANODE}' ssh_port='${SSH_PORT}' tuning='${RUN_TUNING}' dns-switch='${RUN_DNS_SWITCH}' dns-profile='${DNS_PROFILE:-<auto>}' tailscale='${RUN_TAILSCALE}'"
+
+if [[ -z "${USER_NAME}" ]]; then
+  if _has_tty; then
+    read_tty USER_NAME "Enter username to create (e.g., akadorkin): "
+  fi
+  [[ -n "$USER_NAME" ]] || { err "Username is empty (provide --user)"; exit 1; }
+fi
+ok "User: $USER_NAME"
+HOME_DIR="/home/${USER_NAME}"
+
+###############################################################################
+# STEP 0: HOSTNAME
+###############################################################################
+log "Step 0: hostname"
+CURRENT_HOST="$(hostname 2>/dev/null || true)"
+NEW_HOST=""
+if _has_tty; then
+  read_tty NEW_HOST "Enter hostname (press Enter to keep '${CURRENT_HOST}'): "
+fi
+if [[ -n "${NEW_HOST:-}" ]]; then
+  runq "hostnamectl set-hostname" hostnamectl set-hostname "${NEW_HOST}" || true
+  ok "Hostname set to: ${NEW_HOST}"
+else
+  ok "Hostname unchanged: ${CURRENT_HOST}"
+fi
+
+###############################################################################
+# PORTS
+###############################################################################
+pick_open_ports
+ensure_port_in_open_ports "${SSH_PORT}"
+
+###############################################################################
+# REMNANODE: ASK EARLY
+###############################################################################
+if [[ "${REMNANODE}" == "1" ]]; then
+  log "remnanode=1 -> requesting parameters"
+
+  NODE_PORT="${NODE_PORT:-2222}"
+
+  if _has_tty; then
+    read_tty NODE_PORT "Enter NODE_PORT for remnanode (default: 2222): "
+    [[ -n "${NODE_PORT}" ]] || NODE_PORT="2222"
+    read_tty_silent SECRET_KEY "Paste SECRET_KEY (input hidden): "
+  else
+    warn "/dev/tty is not available — cannot prompt for remnanode parameters"
+  fi
+
+  [[ -n "${NODE_PORT:-}" ]] || NODE_PORT="2222"
+  if [[ -z "${SECRET_KEY:-}" ]]; then
+    err "SECRET_KEY is empty — remnanode compose will not be created"
+    REMNANODE="0"
+  else
+    ok "remnanode parameters received"
+  fi
+fi
+
+###############################################################################
+# APT
+###############################################################################
 aptq "APT update" update
 aptq "APT upgrade" upgrade
 aptq "Install base packages" install \
@@ -519,6 +670,12 @@ if [[ "${PASS_CREATED}" == "1" ]]; then
   chmod 600 "${PASS_FILE}" || true
   ok "Saved credentials to: ${PASS_FILE} (root-only)"
 fi
+
+###############################################################################
+# ZSH STACK (FIX)
+###############################################################################
+zsh_stack_for_user "${USER_NAME}" "${HOME_DIR}" || warn "Zsh stack for ${USER_NAME} failed — continuing"
+zsh_stack_for_root "${HOME_DIR}" || warn "Zsh stack for root failed — continuing"
 
 # SSHD hardening AFTER keys are in place
 harden_sshd
@@ -709,7 +866,6 @@ if [[ -f /etc/default/ufw ]]; then
   fi
 fi
 
-# Detect external iface reliably
 INTERNET_IFACE="$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -n1 || true)"
 [[ -n "$INTERNET_IFACE" ]] || INTERNET_IFACE="$(ip route 2>/dev/null | awk '/default/ {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -n1 || true)"
 
@@ -727,7 +883,6 @@ else
     ufw allow in on "${INTERNET_IFACE}" to any port "${port}" proto udp >/dev/null 2>&1 || true
   done
 
-  # Docker interfaces: open all (in/out) on docker0/br-*
   DOCKER_IFACES="$(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^(docker0|br-)/ {print $2}' || true)"
   if [[ -n "${DOCKER_IFACES}" ]]; then
     for IFACE in ${DOCKER_IFACES}; do
@@ -736,7 +891,6 @@ else
     done
   fi
 
-  # Tailscale interface: open all if present
   if ip link show tailscale0 >/dev/null 2>&1; then
     ufw allow in on tailscale0  >/dev/null 2>&1 || true
     ufw allow out on tailscale0 >/dev/null 2>&1 || true
@@ -917,7 +1071,7 @@ case "${REBOOT_DELAY}" in
 esac
 
 ###############################################################################
-# FINAL REPORT
+# FINAL REPORT (unchanged)
 ###############################################################################
 emoji_service() {
   local unit="$1"
