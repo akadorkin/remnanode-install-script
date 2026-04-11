@@ -671,7 +671,7 @@ if [[ "${PASS_CREATED}" == "1" ]]; then
   section "🔐 New user credentials"
   echo "  User:     ${USER_NAME}"
   echo "  Password: ${PASS_GEN}"
-  printf "%s:%s\n" "${USER_NAME}" "${PASS_GEN}" > "${PASS_FILE}"
+  printf "%s:%s\n" "${USER_NAME}:${PASS_GEN}" > "${PASS_FILE}"
   chmod 600 "${PASS_FILE}" || true
   ok "Saved credentials to: ${PASS_FILE} (root-only)"
 fi
@@ -1229,6 +1229,11 @@ echo "  External IPv4:  ${EXT_IP4} ${FLAG}"
 [[ -n "$ORG" ]] && echo "  Provider/ASN:   ${ORG}"
 echo "  Open ports:     ${OPEN_PORTS[*]}"
 echo "  SSH port:       ${SSH_PORT}"
+if [[ "${RUN_TAILSCALE}" == "1" ]]; then
+  echo "  SSH access:     tailscale0 only"
+else
+  echo "  SSH access:     public + local"
+fi
 echo "  PasswordAuth:   ${SSH_PASS_AUTH}"
 echo "  RootLogin:      ${SSH_ROOT_LOGIN}"
 echo "  Fail2ban jails: ${F2B_JAILS}"
