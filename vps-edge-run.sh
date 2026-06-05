@@ -153,12 +153,21 @@ PY2
   echo
   echo "🔄 Reboot"
   echo "------------------------------------------------------------"
-  printf "Scheduled       : %s\n" "$(date -d '+3 minutes' '+%F %T %Z' 2>/dev/null || echo 'in 3 minutes')"
-  echo "Cancel command  : sudo shutdown -c"
+  if [[ "${DEPLOY_RESULT:-success}" == "success" ]]; then
+    printf "Scheduled       : %s\n" "$(date -d '+3 minutes' '+%F %T %Z' 2>/dev/null || echo 'in 3 minutes')"
+    echo "Cancel command  : sudo shutdown -c"
+  else
+    echo "Scheduled       : no, install failed"
+    echo "Cancel command  : n/a"
+  fi
   echo
 
   echo "============================================================"
-  echo " ✅ INSTALLATION SUCCESSFUL"
+  if [[ "${DEPLOY_RESULT:-success}" == "success" ]]; then
+    echo " ✅ INSTALLATION SUCCESSFUL"
+  else
+    echo " ❌ INSTALLATION FAILED: ${DEPLOY_RESULT}"
+  fi
   echo "============================================================"
 }
 
@@ -166,7 +175,18 @@ schedule_final_reboot() {
   shutdown -r +3 "Bootstrap completed. Reboot scheduled in 3 minutes." >/dev/null 2>&1 || true
 }
 
-trap 'schedule_final_reboot; print_final_summary_tail' EXIT
+on_exit() {
+  local rc="$?"
+  if [[ "$rc" == "0" ]]; then
+    DEPLOY_RESULT="success"
+    schedule_final_reboot
+  else
+    DEPLOY_RESULT="$rc"
+  fi
+  print_final_summary_tail
+  exit "$rc"
+}
+trap on_exit EXIT
 
 
 
@@ -193,7 +213,8 @@ trap 'schedule_final_reboot; print_final_summary_tail' EXIT
 # - RemnaNode NODE_PORT is fixed to 2222
 # - RemnaNode SECRET_KEY is required; it is written directly into docker-compose.yml (no .env)
 # - Timezone is always set to Europe/Moscow
-# - If reboot is disabled, UFW rules are staged but UFW is NOT enabled
+# - UFW is enabled automatically after rules are configured
+# - Reboot is scheduled automatically 3 minutes after install
 ###############################################################################
 
 ###############################################################################
@@ -239,7 +260,7 @@ Options:
   --ports ask|skip | --ports=ask|skip                (default: ask if TTY, else skip)
   --open-ports "<list>" | --open-ports="<list>"      external TCP+UDP ports only; SSH is opened only if listed
   --tailscale-only 0|1 | --tailscale-only=0|1        open no public ports except mandatory 80/443 when Remna/certbot is enabled; allow all via tailscale0
-  --enable-ufw-now 0|1 | --enable-ufw-now=0|1        actually enable UFW now (default: 0, staged only)
+  --enable-ufw-now 0|1 | --enable-ufw-now=0|1        deprecated; UFW is enabled automatically at the end
   --dns-* options are ignored; DNS is fixed to Cloudflare
   --tailscale 0|1 | --tailscale=0|1                  (default: 0)
   --domain <fqdn> | --domain=<fqdn>                    remnanode TLS domain for certbot
@@ -710,6 +731,7 @@ zsh_stack_for_user() {
     ok "fzf already exists for ${user}"
   fi
 
+
   runq "download .zshrc (${user})"   curl -fsSL "https://kadorkin.io/zshrc" -o "${home_dir}/.zshrc"
   runq "download .p10k (${user})"    curl -fsSL "https://kadorkin.io/p10k"  -o "${home_dir}/.p10k.zsh"
   runq "chown zsh dotfiles (${user})" chown "${user}:${user}" "${home_dir}/.zshrc" "${home_dir}/.p10k.zsh"
@@ -859,7 +881,6 @@ interactive_defaults() {
       ;;
   esac
 
-  ask_yes_no ENABLE_UFW_NOW "Enable UFW immediately now (unsafe unless Tailscale/console access is confirmed)" "n"
 
   echo ""
   section "Configuration summary"
@@ -874,7 +895,6 @@ interactive_defaults() {
   echo "  DNS profile:   Cloudflare"
   echo "  Firewall:      $([[ "${TAILSCALE_ONLY}" == "1" ]] && echo tailscale-only || echo selected-public-ports)"
   echo "  Open ports:    ${OPEN_PORTS_RAW:-<none>}"
-  echo "  Enable UFW:    ${ENABLE_UFW_NOW}"
 
   ask_yes_no __confirm "Continue" "y"
   [[ "$__confirm" == "1" ]] || { echo "Aborted"; exit 1; }
@@ -1295,6 +1315,7 @@ grep -q '^/usr/bin/zsh$' /etc/shells || echo '/usr/bin/zsh' >> /etc/shells
 
 pick_open_ports
 ensure_cert_public_ports
+EFFECTIVE_PUBLIC_PORTS="${OPEN_PORTS[*]:-80 443}"
 
 ###############################################################################
 # TUNING (external, non-interactive)
@@ -1601,6 +1622,10 @@ EOF
 chmod 0755 /usr/local/sbin/update-rugov-nftables
 
 cat > /etc/cron.d/update-rugov-nftables <<'EOF'
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+@reboot root /usr/local/sbin/update-rugov-nftables >> /var/log/update-rugov-nftables.log 2>&1
 0 2 * * * root /usr/local/sbin/update-rugov-nftables >> /var/log/update-rugov-nftables.log 2>&1
 EOF
 chmod 0644 /etc/cron.d/update-rugov-nftables
@@ -1684,6 +1709,14 @@ else
   else
     ufw deny in on "${INTERNET_IFACE}" to any port "${SSH_PORT}" proto tcp >/dev/null 2>&1 || true
     ufw deny in on "${INTERNET_IFACE}" to any port "${SSH_PORT}" proto udp >/dev/null 2>&1 || true
+    ufw deny in on "${INTERNET_IFACE}" to any port 2222 proto tcp >/dev/null 2>&1 || true
+    ufw deny in on "${INTERNET_IFACE}" to any port 2222 proto udp >/dev/null 2>&1 || true
+    ufw deny in on "${INTERNET_IFACE}" to any port 5443 proto tcp >/dev/null 2>&1 || true
+    ufw deny in on "${INTERNET_IFACE}" to any port 5443 proto udp >/dev/null 2>&1 || true
+    ufw deny in on "${INTERNET_IFACE}" to any port 5444 proto tcp >/dev/null 2>&1 || true
+    ufw deny in on "${INTERNET_IFACE}" to any port 5444 proto udp >/dev/null 2>&1 || true
+    ufw deny in on "${INTERNET_IFACE}" to any port 9100 proto tcp >/dev/null 2>&1 || true
+    ufw deny in on "${INTERNET_IFACE}" to any port 9100 proto udp >/dev/null 2>&1 || true
     ok "Public SSH is closed; SSH remains available over tailscale0 if Tailscale is up"
   fi
 
@@ -1702,15 +1735,7 @@ else
     ufw deny out "$rule" >/dev/null 2>&1 || true
   done
 
-  # Safety: never enable UFW automatically by default. This prevents public SSH lockout.
-  # Rules are staged in UFW; enable manually after confirming Tailscale/console access:
-  #   sudo ufw --force enable
-  if [[ "${ENABLE_UFW_NOW:-0}" == "1" ]]; then
-    warn "--enable-ufw-now=1 was requested; enabling UFW now"
-    runq "ufw enable" ufw --force enable
-  else
-    warn "UFW rules staged but NOT enabled to avoid lockout. Enable later with: sudo ufw --force enable"
-  fi
+  ok "UFW rules staged; final enable will happen at the end"
 fi
 
 ###############################################################################
@@ -1791,212 +1816,20 @@ else
 fi
 
 ###############################################################################
+# FINAL FIREWALL ENABLE
+###############################################################################
+log "Final firewall enable"
+
+if command -v ufw >/dev/null 2>&1; then
+  runq "ufw enable" ufw --force enable || true
+  ok "UFW enabled and will start on boot"
+else
+  warn "ufw binary not found at final enable step"
+fi
+
+###############################################################################
 # AUTOREMOVE
 ###############################################################################
 aptq "Autoremove" autoremove --purge
-
-###############################################################################
-# FINAL REPORT
-###############################################################################
-emoji_service() {
-  local unit="$1"
-  if systemctl is-active --quiet "$unit" 2>/dev/null; then echo "✅"; else echo "❌"; fi
-}
-
-external_ip4() {
-  curl -4 -fsSL ifconfig.me 2>/dev/null || curl -4 -fsSL https://api.ipify.org 2>/dev/null || true
-}
-
-ip_identity() {
-  local ip="$1"
-  [[ -n "$ip" ]] || { echo ""; return 0; }
-  curl -fsSL "https://ipinfo.io/${ip}/json" 2>/dev/null || true
-}
-
-iface_ipv4() {
-  local ifc="${1:-}"
-  [[ -n "$ifc" ]] || { echo ""; return 0; }
-  ip -4 -o addr show dev "$ifc" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true
-}
-
-flag_from_country() {
-  local cc="${1:-}"
-  [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || { echo ""; return 0; }
-  cc="$(echo "$cc" | tr '[:lower:]' '[:upper:]')"
-
-  local a b code1 code2 esc
-  a="${cc:0:1}"
-  b="${cc:1:1}"
-
-  code1=$(( 127462 + $(printf '%d' "'$a") - 65 ))
-  code2=$(( 127462 + $(printf '%d' "'$b") - 65 ))
-
-  printf -v esc '\\U%08X\\U%08X' "$code1" "$code2"
-  printf '%b' "$esc"
-}
-
-remna_status() {
-  if ! command -v docker >/dev/null 2>&1; then
-    echo "  Status:        ❌ docker missing"
-    return 0
-  fi
-
-  if ! docker ps --format '{{.Names}}' | grep -qx 'remnanode'; then
-    if docker ps -a --format '{{.Names}}' | grep -qx 'remnanode'; then
-      echo "  Status:        ❌ stopped"
-    else
-      echo "  Status:        ⚠️ not found"
-    fi
-    return 0
-  fi
-
-  echo "  Status:        ✅ running"
-
-  local started
-  started="$(docker inspect -f '{{.State.StartedAt}}' remnanode 2>/dev/null || true)"
-  if [[ -n "$started" ]]; then
-    echo "  Started:       ${started}"
-  fi
-}
-
-sys_summary() {
-  local up cores ram_mib root_line
-  up="$(uptime -p 2>/dev/null || uptime)"
-  cores="$(nproc 2>/dev/null || echo "?")"
-  ram_mib="$(awk '/MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo "?")"
-  root_line="$(df -hP / 2>/dev/null | awk 'NR==2{print $2 " total, " $3 " used, " $4 " free (" $5 ")"}' || true)"
-
-  echo "  Uptime:        ${up}"
-  echo "  CPU cores:     ${cores}"
-  echo "  RAM:           ${ram_mib} MiB"
-  echo "  Root FS:       ${root_line:-?}"
-}
-
-SSH_PASS_AUTH="$(get_sshd_effective passwordauthentication)"
-SSH_ROOT_LOGIN="$(get_sshd_effective permitrootlogin)"
-[[ -z "${SSH_PASS_AUTH:-}" ]] && SSH_PASS_AUTH="unknown"
-[[ -z "${SSH_ROOT_LOGIN:-}" ]] && SSH_ROOT_LOGIN="unknown"
-
-F2B_JAILS="$(fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:\s*//p' | tr -d '\r' || true)"
-[[ -z "${F2B_JAILS:-}" ]] && F2B_JAILS="(unknown)"
-
-EXT_IP4="$(external_ip4 || true)"; [[ -z "$EXT_IP4" ]] && EXT_IP4="unknown"
-IFACE_IP4="$(iface_ipv4 "${INTERNET_IFACE:-}" || true)"
-IP_JSON="$(ip_identity "$EXT_IP4" || true)"
-CC="$(echo "$IP_JSON" | jq -r '.country // empty' 2>/dev/null || true)"
-CITY="$(echo "$IP_JSON" | jq -r '.city // empty' 2>/dev/null || true)"
-REGION="$(echo "$IP_JSON" | jq -r '.region // empty' 2>/dev/null || true)"
-ORG="$(echo "$IP_JSON" | jq -r '.org // empty' 2>/dev/null || true)"
-FLAG="$(flag_from_country "$CC" 2>/dev/null || true)"
-
-TS_IP_NOW="${TS_IP_EARLY:-$(tailscale ip -4 2>/dev/null || true)}"
-TS_DNS_NOW="${TS_DNS_EARLY:-$(tailscale_magicdns_full || true)}"
-[[ -z "${TS_DNS_NOW:-}" ]] && TS_DNS_NOW="(unavailable)"
-
-TCP_CC="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '-')"
-QDISC="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '-')"
-FWD="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo '-')"
-CTMAX="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo '-')"
-NOFILE="$(systemctl show --property DefaultLimitNOFILE 2>/dev/null | cut -d= -f2 || echo '-')"
-
-section "✅ DEPLOY SUMMARY — $(date -Iseconds)"
-
-echo "  Tailscale IPv4: ${TS_IP_NOW:-not assigned}"
-echo "  Tailscale DNS:  ${TS_DNS_NOW}"
-echo "  External IPv4:  ${EXT_IP4} ${FLAG}"
-[[ -n "${CITY}${REGION}${CC}" ]] && echo "  Location:       ${CITY}${CITY:+, }${REGION}${REGION:+, }${CC}"
-[[ -n "$ORG" ]] && echo "  Provider/ASN:   ${ORG}"
-if [[ "${TAILSCALE_ONLY:-0}" == "1" ]]; then
-  echo "  Open ports:     none (tailscale-only mode)"
-else
-  echo "  Open ports:     ${OPEN_PORTS[*]}"
-fi
-echo "  SSH port:       ${SSH_PORT}"
-echo "  Timezone:       $(timedatectl show -p Timezone --value 2>/dev/null || echo unknown)"
-if [[ "${TAILSCALE_ONLY:-0}" == "1" ]]; then
-  echo "  SSH access:     tailscale0 only / public closed"
-elif printf ' %s ' "${OPEN_PORTS[@]}" | grep -q " ${SSH_PORT} "; then
-  echo "  SSH access:     public explicitly opened + tailscale0"
-else
-  echo "  SSH access:     tailscale0 only / public closed"
-fi
-echo "  PasswordAuth:   ${SSH_PASS_AUTH}"
-echo "  RootLogin:      ${SSH_ROOT_LOGIN}"
-echo "  Fail2ban jails: ${F2B_JAILS}"
-echo "  tcp cc:         ${TCP_CC}"
-echo "  qdisc:          ${QDISC}"
-echo "  forward:        ${FWD}"
-echo "  ct max:         ${CTMAX}"
-echo "  nofile:         ${NOFILE}"
-
-section "🧩 Services"
-echo "  docker:         $(emoji_service docker)"
-echo "  tailscaled:     $(emoji_service tailscaled)"
-echo "  fail2ban:       $(emoji_service fail2ban)"
-echo "  ufw:            $(emoji_service ufw)"
-echo "  node_exporter:  $(emoji_service node_exporter)"
-
-section "📦 Remnanode"
-remna_status
-echo "  NODE_PORT:      ${NODE_PORT}"
-echo "  TLS domain:     ${REMNANODE_DOMAIN:-not configured}"
-echo "  Cert path:      /opt/certbot/certs/live/remnanode/fullchain.pem -> mounted as /opt/certbot/certs/live/remnanode/fullchain.pem"
-
-section "🧭 Changes applied"
-echo "  Tailscale:      ${RUN_TAILSCALE}"
-echo "  RemnaNode:      ${REMNANODE}"
-echo "  SECRET_KEY:     $([[ -n "${SECRET_KEY:-}" ]] && echo configured || echo not-configured)"
-echo "  Geo timer:      installed/enabled when RemnaNode is configured"
-echo "  RUGOV blocklist: installed with cron /etc/cron.d/update-rugov-nftables"
-echo "  Firewall:       tailscale0 allow all; public SSH closed unless explicitly opened"
-echo "  Certbot:        Docker standalone in /opt/certbot, renew via cron"
-echo "  Cert ports:     80/tcp, 443/tcp, 443/udp opened when RemnaNode/certbot is enabled"
-echo "  UFW enabled:    ${ENABLE_UFW_NOW}"
-
-section "📦 Logs"
-echo "  APT:            ${APT_LOG}"
-echo "  Docker:         /var/log/install-docker.log"
-echo "  Tailscale:      /var/log/install-tailscale.log"
-echo "  Remnanode:      /var/log/remnanode"
-echo "  Rugov:          /var/log/update-rugov-nftables.log"
-echo "  Fail2ban:       /var/log/fail2ban.log"
-
-public_ip_geo_summary() {
-  local ip country city cc flag
-  ip="$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
-  if [[ -n "$ip" ]]; then
-    geo_json="$(curl -fsS --max-time 5 "https://ipapi.co/${ip}/json/" 2>/dev/null || true)"
-    city="$(jq -r '.city // empty' <<<"$geo_json" 2>/dev/null || true)"
-    country="$(jq -r '.country_name // empty' <<<"$geo_json" 2>/dev/null || true)"
-    cc="$(jq -r '.country_code // empty' <<<"$geo_json" 2>/dev/null || true)"
-    flag=""
-    case "$cc" in
-      RU) flag="🇷🇺";; DE) flag="🇩🇪";; FI) flag="🇫🇮";; NL) flag="🇳🇱";; PL) flag="🇵🇱";; US) flag="🇺🇸";; TR) flag="🇹🇷";; LV) flag="🇱🇻";; SG) flag="🇸🇬";; GB) flag="🇬🇧";; FR) flag="🇫🇷";; *) flag="";;
-    esac
-    echo "  Public IPv4:    ${ip}"
-    echo "  Location:       ${flag} ${country:-unknown}${city:+ / $city}"
-  else
-    echo "  Public IPv4:    unknown"
-    echo "  Location:       unknown"
-  fi
-}
-
-tailscale_summary_bottom() {
-  local ts_ip ts_dns ts_state
-  ts_ip="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
-  ts_dns="$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' 2>/dev/null || true)"
-  ts_state="$(tailscale status --json 2>/dev/null | jq -r '.BackendState // empty' 2>/dev/null || true)"
-  echo "  Tailscale IPv4: ${ts_ip:-not connected}"
-  echo "  Tailscale DNS:  ${ts_dns:-not available}"
-  echo "  Tailscale state:${ts_state:-unknown}"
-}
-
-section "🌐 Network summary"
-public_ip_geo_summary
-tailscale_summary_bottom
-
-section "🧾 System"
-sys_summary
-
 
 exit 0
