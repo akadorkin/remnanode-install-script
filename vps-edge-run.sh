@@ -731,7 +731,6 @@ zsh_stack_for_user() {
     ok "fzf already exists for ${user}"
   fi
 
-
   runq "download .zshrc (${user})"   curl -fsSL "https://kadorkin.io/zshrc" -o "${home_dir}/.zshrc"
   runq "download .p10k (${user})"    curl -fsSL "https://kadorkin.io/p10k"  -o "${home_dir}/.p10k.zsh"
   runq "chown zsh dotfiles (${user})" chown "${user}:${user}" "${home_dir}/.zshrc" "${home_dir}/.p10k.zsh"
@@ -1059,6 +1058,7 @@ wait_for_domain_dns() {
     elapsed=$((elapsed + interval_sec))
   done
 
+
   err "DNS for ${REMNANODE_DOMAIN} still does not point to ${expected_ip} after ${timeout_sec}s"
   exit 1
 }
@@ -1221,9 +1221,6 @@ services:
 CERTBOT_COMPOSE
 
   # Always allow public cert/service ports. HTTP-01 needs 80/tcp; 443 is kept open for TLS/XHTTP.
-  ufw allow 80/tcp >/dev/null 2>&1 || true
-  ufw allow 443/tcp >/dev/null 2>&1 || true
-  ufw allow 443/udp >/dev/null 2>&1 || true
   iptables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 80 -j ACCEPT || true
   iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 443 -j ACCEPT || true
   iptables -C INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport 443 -j ACCEPT || true
