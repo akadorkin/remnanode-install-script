@@ -223,7 +223,7 @@ NODE_PORT="2222"
 SECRET_KEY=""
 REMNANODE_DOMAIN=""
 
-DEFAULT_OPEN_PORTS=(1080 1090 443 80 1480 1194)
+DEFAULT_OPEN_PORTS=(80 443)
 
 usage() {
   cat <<'EOF'
@@ -752,6 +752,7 @@ zsh_stack_for_root() {
     chown -R root:root "${root_home}/.oh-my-zsh" || true
   fi
 
+
   if [[ ! -d "${root_home}/.oh-my-zsh" ]]; then
     RUNZSH=no KEEP_ZSHRC=yes CHSH=no \
       sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" || true
@@ -1176,7 +1177,6 @@ else:
 path.write_text(s)
 COMPOSE_ENV_PY
 
-
   docker compose -f "$compose" config >/dev/null
   ok "Compose environment normalized: NODE_PORT=${NODE_PORT}, SECRET_KEY=<configured>"
 }
@@ -1229,8 +1229,9 @@ CERTBOT_COMPOSE
     echo '0 0 28 * * cd /opt/certbot && docker compose run --rm certbot renew >/dev/null 2>&1'
   ) | crontab -
 
-  ok "Certificate ready: /etc/letsencrypt/live/remnanode/fullchain.pem"
+  ok "Certificate ready: /opt/certbot/certs/live/remnanode/fullchain.pem"
 }
+
 
 ###############################################################################
 # Step 3: remnanode parameters
@@ -1941,7 +1942,7 @@ section "📦 Remnanode"
 remna_status
 echo "  NODE_PORT:      ${NODE_PORT}"
 echo "  TLS domain:     ${REMNANODE_DOMAIN:-not configured}"
-echo "  Cert path:      /opt/certbot/certs/live/remnanode/fullchain.pem -> mounted as /etc/letsencrypt/live/remnanode/fullchain.pem"
+echo "  Cert path:      /opt/certbot/certs/live/remnanode/fullchain.pem -> mounted as /opt/certbot/certs/live/remnanode/fullchain.pem"
 
 section "🧭 Changes applied"
 echo "  Tailscale:      ${RUN_TAILSCALE}"
