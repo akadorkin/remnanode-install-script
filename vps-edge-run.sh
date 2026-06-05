@@ -752,7 +752,6 @@ zsh_stack_for_root() {
     chown -R root:root "${root_home}/.oh-my-zsh" || true
   fi
 
-
   if [[ ! -d "${root_home}/.oh-my-zsh" ]]; then
     RUNZSH=no KEEP_ZSHRC=yes CHSH=no \
       sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" || true
@@ -1231,7 +1230,6 @@ CERTBOT_COMPOSE
 
   ok "Certificate ready: /opt/certbot/certs/live/remnanode/fullchain.pem"
 }
-
 
 ###############################################################################
 # Step 3: remnanode parameters
@@ -1999,8 +1997,6 @@ tailscale_summary_bottom
 
 section "🧾 System"
 sys_summary
-
-
 
 
 exit 0
