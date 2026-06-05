@@ -1,42 +1,227 @@
+❯ cat /root/vps-edge-run-final-production-v5-clean.sh
 #!/usr/bin/env bash
 set -Eeuo pipefail
+
+print_final_summary_tail() {
+  set +e
+  set +o pipefail 2>/dev/null || true
+
+  public_ip="$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+  geo="$(curl -4 -fsS --max-time 7 https://ipinfo.io/json 2>/dev/null || true)"
+
+  city="$(echo "$geo" | jq -r '.city // "unknown"' 2>/dev/null || echo unknown)"
+  region="$(echo "$geo" | jq -r '.region // empty' 2>/dev/null || true)"
+  country="$(echo "$geo" | jq -r '.country // "unknown"' 2>/dev/null || echo unknown)"
+  org="$(echo "$geo" | jq -r '.org // "unknown"' 2>/dev/null || echo unknown)"
+
+  flag=""
+  if [[ "$country" =~ ^[A-Z][A-Z]$ ]]; then
+    flag="$(python3 - <<PY2 2>/dev/null || true
+cc="$country"
+print("".join(chr(127397 + ord(c)) for c in cc))
+PY2
+)"
+  fi
+
+  ts_ip="$(tailscale ip -4 2>/dev/null | awk 'NR==1{print; exit}')"
+  ts_dns="$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' 2>/dev/null || true)"
+  ts_state="$(tailscale status --json 2>/dev/null | jq -r '.BackendState // empty' 2>/dev/null || true)"
+
+  remna_state="$(docker inspect -f '{{.State.Status}}' remnanode 2>/dev/null || echo not-found)"
+  docker_state="$(systemctl is-active docker 2>/dev/null || echo unknown)"
+  if systemctl list-unit-files 2>/dev/null | grep -q '^haproxy.service'; then
+    haproxy_state="$(systemctl is-active haproxy 2>/dev/null || echo unknown)"
+  else
+    haproxy_state="not-installed"
+  fi
+  fail2ban_state="$(systemctl is-active fail2ban 2>/dev/null || echo unknown)"
+  geo_timer_state="$(systemctl is-active update-roscomvpn-geo.timer 2>/dev/null || echo unknown)"
+  node_exporter_state="$(systemctl is-active node_exporter 2>/dev/null || echo unknown)"
+  if ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw_state="✅ active"
+  else
+    ufw_state="⚠ inactive"
+  fi
+
+  cert_subject="not available"
+  cert_expire_raw=""
+  cert_expire="not available"
+  domain="${DOMAIN:-}"
+
+  if [[ -f /opt/certbot/certs/live/remnanode/fullchain.pem ]]; then
+    cert_subject="$(openssl x509 -in /opt/certbot/certs/live/remnanode/fullchain.pem -noout -subject 2>/dev/null | sed 's/^subject=//')"
+    cert_expire_raw="$(openssl x509 -in /opt/certbot/certs/live/remnanode/fullchain.pem -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
+    cert_expire="$cert_expire_raw"
+    cert_days_left="$(( ( $(date -d "$cert_expire_raw" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))"
+    [[ -z "$domain" ]] && domain="$(echo "$cert_subject" | sed -n 's/.*CN *= *\([^,\/]*\).*/\1/p')"
+  fi
+
+  [[ -z "$domain" && -f /opt/certbot/certs/renewal/remnanode.conf ]] && \
+    domain="$(grep -E '^domains ?=' /opt/certbot/certs/renewal/remnanode.conf | head -n1 | cut -d= -f2- | xargs)"
+
+  tcp_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+  qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
+  forward="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo unknown)"
+  conntrack="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo unknown)"
+  tw_buckets="$(sysctl -n net.ipv4.tcp_max_tw_buckets 2>/dev/null || echo unknown)"
+  nofile="$(ulimit -n 2>/dev/null || echo unknown)"
+  swap="$(swapon --show --noheadings --bytes 2>/dev/null | awk '{sum+=$3} END{if(sum>0) printf "%.0fG", sum/1024/1024/1024; else print "none"}')"
+  journald="$(grep -E '^(SystemMaxUse|RuntimeMaxUse)=' /etc/systemd/journald.conf /etc/systemd/journald.conf.d/*.conf 2>/dev/null | awk -F= '{print $2}' | paste -sd ' / ' -)"
+  [[ -z "$journald" ]] && journald="unknown"
+
+  svc_icon() {
+    case "$1" in
+      active|running) echo "✅ $1" ;;
+      inactive) echo "⏸ $1" ;;
+      not-found|unknown|"") echo "❔ ${1:-unknown}" ;;
+      *) echo "⚠️ $1" ;;
+    esac
+  }
+
+  echo
+  echo "============================================================"
+  echo " 🚀 DEPLOY COMPLETED"
+  echo "============================================================"
+  echo
+  echo "🌍 Server"
+  echo "------------------------------------------------------------"
+  printf "Hostname        : %s\n" "$(hostname)"
+  printf "Public IPv4     : %s\n" "${public_ip:-unknown}"
+  printf "Location        : %s %s%s (%s)\n" "${flag:-}" "$city" "${region:+, $region}" "$country"
+  printf "Provider        : %s\n" "$org"
+  echo
+  echo "🔒 Network"
+  echo "------------------------------------------------------------"
+  printf "Tailscale IPv4  : %s\n" "${ts_ip:-not available}"
+  printf "MagicDNS        : %s\n" "${ts_dns:-not available}"
+  printf "State           : %s\n" "${ts_state:-not available}"
+  echo
+  echo "🐳 Services"
+  echo "------------------------------------------------------------"
+  printf "RemnaNode       : %s\n" "$(svc_icon "$remna_state")"
+  printf "Docker          : %s\n" "$(svc_icon "$docker_state")"
+  printf "HAProxy         : %s\n" "$(svc_icon "$haproxy_state")"
+  printf "Fail2ban        : %s\n" "$(svc_icon "$fail2ban_state")"
+  printf "Geo Timer       : %s\n" "$(svc_icon "$geo_timer_state")"
+  printf "Node Exporter   : %s\n" "$(svc_icon "$node_exporter_state")"
+  echo
+  echo "🔐 TLS"
+  echo "------------------------------------------------------------"
+  printf "Domain          : %s\n" "${domain:-unknown}"
+  printf "Certificate     : %s\n" "$([[ -f /opt/certbot/certs/live/remnanode/fullchain.pem ]] && echo "✅ installed" || echo "❌ missing")"
+  printf "Subject         : %s\n" "$cert_subject"
+  printf "Expires         : %s\n" "$cert_expire"
+  printf "Days left       : %s\n" "${cert_days_left:-unknown}"
+  echo
+  uptime_pretty="$(uptime -p 2>/dev/null | sed 's/^up //' || echo unknown)"
+  kernel_ver="$(uname -r 2>/dev/null || echo unknown)"
+
+  echo "⏱ Runtime"
+  echo "------------------------------------------------------------"
+  printf "Uptime          : %s\n" "$uptime_pretty"
+  printf "Kernel          : %s\n" "$kernel_ver"
+  echo
+
+  echo "🛡 Firewall"
+  echo "------------------------------------------------------------"
+  fw_mode="${FIREWALL_MODE_NAME:-tailscale-only}"
+  [[ "$fw_mode" == "tailscale-only" ]] && fw_mode="🔒 tailscale-only" || fw_mode="🌐 public"
+  printf "Mode            : %s\n" "$fw_mode"
+  printf "UFW             : %s\n" "${ufw_state:-inactive}"
+  printf "SSH Public      : ❌ closed by default\n"
+  printf "SSH Tailscale   : ✅ allowed\n"
+  printf "Public ports    : %s\n" "${EFFECTIVE_PUBLIC_PORTS:-80 443}"
+  echo
+  echo "⚙️ System tuning"
+  echo "------------------------------------------------------------"
+  printf "TCP CC          : %s\n" "$tcp_cc"
+  printf "Qdisc           : %s\n" "$qdisc"
+  printf "Forward         : %s\n" "$forward"
+  printf "Conntrack       : %s\n" "$conntrack"
+  printf "TW Buckets      : %s\n" "$tw_buckets"
+  printf "Nofile          : %s\n" "$nofile"
+  printf "Swap            : %s\n" "$swap"
+  printf "Journald        : %s\n" "$journald"
+  printf "Logrotate       : daily / rotate 14\n"
+  echo
+  echo "📂 Important paths"
+  echo "------------------------------------------------------------"
+  echo "Compose         : /opt/remnanode/docker-compose.yml"
+  echo "Certificate     : $(readlink -f /opt/certbot/certs/live/remnanode/fullchain.pem 2>/dev/null || echo /opt/certbot/certs/live/remnanode/fullchain.pem)"
+  echo "Geo files       : /opt/remnanode/roscomvpn-*.dat"
+  echo "Logs            : /var/log/remnanode/"
+  echo
+  echo "🔄 Reboot"
+  echo "------------------------------------------------------------"
+  printf "Scheduled       : %s\n" "$(date -d '+3 minutes' '+%F %T %Z' 2>/dev/null || echo 'in 3 minutes')"
+  echo "Cancel command  : sudo shutdown -c"
+  echo
+
+  echo "============================================================"
+  echo " ✅ INSTALLATION SUCCESSFUL"
+  echo "============================================================"
+}
+
+schedule_final_reboot() {
+  shutdown -r +3 "Bootstrap completed. Reboot scheduled in 3 minutes." >/dev/null 2>&1 || true
+}
+
+trap 'schedule_final_reboot; print_final_summary_tail' EXIT
+
+
+
+
+
+
+
+
 
 ###############################################################################
 # VPS bootstrap
 # Order:
-#   Step 0: hostname
-#   Step 1: tailscale install/auth (optional, EARLY)
-#   Step 2: remnanode secret prompt (optional)
+#   Step 0: summary / confirmation
+#   Step 1: hostname
+#   Step 2: tailscale install/status (optional, EARLY)
+#   Step 3: remnanode secret/domain validation (optional)
 #   Then everything else
 #
 # Notes:
 # - Tailscale uses: tailscale up --ssh --advertise-exit-node
-# - Public SSH is denied via UFW when tailscale is enabled
-# - SSH remains allowed on tailscale0
+# - Firewall model: tailscale0 is fully open
+# - External interface opens ONLY explicit ports, plus mandatory 80/443 when Remna/certbot is enabled
+# - SSH port is fixed to 22; public SSH is NOT opened automatically
+# - RemnaNode NODE_PORT is fixed to 2222
+# - RemnaNode SECRET_KEY is required; it is written directly into docker-compose.yml (no .env)
+# - Timezone is always set to Europe/Moscow
 # - If reboot is disabled, UFW rules are staged but UFW is NOT enabled
-# - Automatic reboot has been removed from the pipeline
 ###############################################################################
 
 ###############################################################################
 # ARG PARSING
 ###############################################################################
 USER_NAME=""
-TIMEZONE="Europe/Moscow"
+NEW_HOST=""
+TIMEZONE="Europe/Moscow"  # fixed: always applied
 REBOOT_DELAY="0"   # deprecated, ignored
 SSH_PORT="${SSH_PORT:-22}"
 REMNANODE="0"
 PORTS_MODE=""
 OPEN_PORTS_RAW=""
-RUN_TUNING="1"
-RUN_DNS_SWITCH="1"
+TAILSCALE_ONLY="0"
+ENABLE_UFW_NOW="0"
+RUN_TUNING="1"  # always enabled
+RUN_DNS_SWITCH="1"  # fixed: Cloudflare DNS, no prompt
+ORIGINAL_ARGC="$#"
+
 
 RUN_TAILSCALE="0"
-DNS_PROFILE=""
+DNS_PROFILE="3"  # fixed: Cloudflare
 DNS_CUSTOM=""
 DNS_FALLBACK=""
 
 NODE_PORT="2222"
 SECRET_KEY=""
+REMNANODE_DOMAIN=""
 
 DEFAULT_OPEN_PORTS=(1080 1090 443 80 1480 1194)
 
@@ -44,57 +229,80 @@ usage() {
   cat <<'EOF'
 Usage: sudo bash initial.sh [options]
 
+If started without options in a TTY, interactive mode asks what to install/configure.
+
 Options:
-  --user <name> | --user=<name>
-  --timezone <IANA> | --timezone=<IANA>              (default: Europe/Moscow)
+  --user <name> | --user=<name> | user=<name>
+  --secret-key <key> | --secret-key=<key> | secret_key=<key>  required for RemnaNode unless existing compose has SECRET_KEY
   --reboot <delay> | --reboot=<delay>                (deprecated, ignored)
-  --remnanode 0|1 | --remnanode=0|1                  (default: 0)
-  --ssh-port <port> | --ssh-port=<port>              (default: 22)
+  --remnanode 0|1 | --remnanode=0|1                  (default: 0; Remna NODE_PORT fixed to 2222)
   --ports ask|skip | --ports=ask|skip                (default: ask if TTY, else skip)
-  --open-ports "<list>" | --open-ports="<list>"      comma/space-separated ports
-  --tuning 0|1 | --tuning=0|1                        (default: 1)
-  --dns-switch 0|1 | --dns-switch=0|1                (default: 1)
-  --dns-profile 1..5 | --dns-profile=1..5            (default: auto)
-  --dns-custom "<servers>"
-  --dns-fallback "<server>"
+  --open-ports "<list>" | --open-ports="<list>"      external TCP+UDP ports only; SSH is opened only if listed
+  --tailscale-only 0|1 | --tailscale-only=0|1        open no public ports except mandatory 80/443 when Remna/certbot is enabled; allow all via tailscale0
+  --enable-ufw-now 0|1 | --enable-ufw-now=0|1        actually enable UFW now (default: 0, staged only)
+  --dns-* options are ignored; DNS is fixed to Cloudflare
   --tailscale 0|1 | --tailscale=0|1                  (default: 0)
+  --domain <fqdn> | --domain=<fqdn>                    remnanode TLS domain for certbot
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --user=*)         USER_NAME="${1#*=}"; shift ;;
-    --timezone=*)     TIMEZONE="${1#*=}"; shift ;;
+    user=*)           USER_NAME="${1#*=}"; shift ;;
+    --secret-key=*)   SECRET_KEY="${1#*=}"; shift ;;
+    secret_key=*)     SECRET_KEY="${1#*=}"; shift ;;
+    --timezone=*)     shift ;;  # ignored; fixed to Europe/Moscow
     --reboot=*)       REBOOT_DELAY="${1#*=}"; shift ;;
     --remnanode=*)    REMNANODE="${1#*=}"; shift ;;
-    --ssh-port=*)     SSH_PORT="${1#*=}"; shift ;;
+    --ssh-port=*)     shift ;;  # ignored; fixed to 22
     --ports=*)        PORTS_MODE="${1#*=}"; shift ;;
     --open-ports=*)   OPEN_PORTS_RAW="${1#*=}"; shift ;;
-    --tuning=*)       RUN_TUNING="${1#*=}"; shift ;;
+    --tailscale-only=*) TAILSCALE_ONLY="${1#*=}"; shift ;;
+    --enable-ufw-now=*) ENABLE_UFW_NOW="${1#*=}"; shift ;;
+    --tuning=*)       shift ;;  # ignored; always enabled
     --dns-switch=*)   RUN_DNS_SWITCH="${1#*=}"; shift ;;
     --dns-profile=*)  DNS_PROFILE="${1#*=}"; shift ;;
     --dns-custom=*)   DNS_CUSTOM="${1#*=}"; shift ;;
     --dns-fallback=*) DNS_FALLBACK="${1#*=}"; shift ;;
     --tailscale=*)    RUN_TAILSCALE="${1#*=}"; shift ;;
+    --hostname=*)     NEW_HOST="${1#*=}"; shift ;;
+    hostname=*)       NEW_HOST="${1#*=}"; shift ;;
+    --domain=*)       REMNANODE_DOMAIN="${1#*=}"; shift ;;
 
     --user)         USER_NAME="${2:-}"; shift 2 ;;
-    --timezone)     TIMEZONE="${2:-}"; shift 2 ;;
+    --secret-key)   SECRET_KEY="${2:-}"; shift 2 ;;
+    --timezone)     shift 2 ;;  # ignored; fixed to Europe/Moscow
     --reboot)       REBOOT_DELAY="${2:-0}"; shift 2 ;;
     --remnanode)    REMNANODE="${2:-0}"; shift 2 ;;
-    --ssh-port)     SSH_PORT="${2:-22}"; shift 2 ;;
+    --ssh-port)     shift 2 ;;  # ignored; fixed to 22
     --ports)        PORTS_MODE="${2:-}"; shift 2 ;;
     --open-ports)   OPEN_PORTS_RAW="${2:-}"; shift 2 ;;
-    --tuning)       RUN_TUNING="${2:-1}"; shift 2 ;;
+    --tailscale-only) TAILSCALE_ONLY="${2:-1}"; shift 2 ;;
+    --enable-ufw-now) ENABLE_UFW_NOW="${2:-1}"; shift 2 ;;
+    --tuning)       shift 2 ;;  # ignored; always enabled
     --dns-switch)   RUN_DNS_SWITCH="${2:-1}"; shift 2 ;;
     --dns-profile)  DNS_PROFILE="${2:-}"; shift 2 ;;
     --dns-custom)   DNS_CUSTOM="${2:-}"; shift 2 ;;
     --dns-fallback) DNS_FALLBACK="${2:-}"; shift 2 ;;
     --tailscale)    RUN_TAILSCALE="${2:-0}"; shift 2 ;;
+    --hostname)     NEW_HOST="${2:-}"; shift 2 ;;
+    --domain)       REMNANODE_DOMAIN="${2:-}"; shift 2 ;;
 
+    --tailscale-only) TAILSCALE_ONLY="1"; shift ;;
+    --enable-ufw-now) ENABLE_UFW_NOW="1"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1"; usage; exit 1 ;;
   esac
 done
+
+SSH_PORT="22"  # fixed: never changed interactively
+RUN_TUNING="1" # fixed: always enabled
+RUN_DNS_SWITCH="1"
+DNS_PROFILE="3"
+DNS_CUSTOM=""
+DNS_FALLBACK=""
+
 
 ###############################################################################
 # OUTPUT HELPERS
@@ -158,6 +366,33 @@ read_tty_silent() {
   printf -v "$__var" '%s' "$__v"
 }
 
+
+ask_yes_no() {
+  local __var="$1" __prompt="$2" __default="${3:-y}" __ans=""
+  local __hint="[y/N]"
+  [[ "$__default" =~ ^[Yy1]$ ]] && __hint="[Y/n]"
+  while true; do
+    read_tty __ans "$__prompt $__hint: "
+    __ans="${__ans:-$__default}"
+    case "$__ans" in
+      y|Y|yes|YES|Yes|1|true|TRUE) printf -v "$__var" '1'; return 0 ;;
+      n|N|no|NO|No|0|false|FALSE) printf -v "$__var" '0'; return 0 ;;
+      *) echo "Please answer y or n" >/dev/tty ;;
+    esac
+  done
+}
+
+ask_value_default() {
+  local __var="$1" __prompt="$2" __default="${3:-}" __ans=""
+  if [[ -n "$__default" ]]; then
+    read_tty __ans "$__prompt [$__default]: "
+    __ans="${__ans:-$__default}"
+  else
+    read_tty __ans "$__prompt: "
+  fi
+  printf -v "$__var" '%s' "$__ans"
+}
+
 ###############################################################################
 # HELPERS
 ###############################################################################
@@ -182,8 +417,31 @@ _ports_sanitize_to_array() {
   OPEN_PORTS=("${dedup[@]}")
 }
 
+ensure_cert_public_ports() {
+  # RemnaNode certbot standalone needs public 80/tcp for HTTP-01.
+  # 443 is also kept public for TLS/XHTTP service readiness, even in tailscale-only mode.
+  [[ "${REMNANODE:-0}" == "1" ]] || return 0
+
+  local p seen=" " out=()
+  for p in "${OPEN_PORTS[@]:-}" 80 443; do
+    [[ -n "${p:-}" ]] || continue
+    if [[ "$seen" != *" $p "* ]]; then
+      out+=("$p")
+      seen+=" $p "
+    fi
+  done
+  OPEN_PORTS=("${out[@]}")
+  ok "Cert/Remna public ports are mandatory: 80 443; effective external ports: ${OPEN_PORTS[*]}"
+}
+
 pick_open_ports() {
   OPEN_PORTS=("${DEFAULT_OPEN_PORTS[@]}")
+
+  if [[ "${TAILSCALE_ONLY:-0}" == "1" ]]; then
+    OPEN_PORTS=()
+    ok "Tailscale-only mode: no external ports will be opened"
+    return 0
+  fi
 
   if [[ -n "${OPEN_PORTS_RAW:-}" ]]; then
     _ports_sanitize_to_array "$OPEN_PORTS_RAW"
@@ -248,17 +506,19 @@ aptq() {
 apply_fd_limits() {
   log "FD limits (kernel + systemd defaults)"
 
-  install -m 0644 /dev/stdin /etc/sysctl.d/99-fd.conf <<'EOF'
+  cat > /etc/sysctl.d/99-fd.conf <<'EOF'
 fs.file-max = 2097152
 fs.nr_open = 2097152
 EOF
+  chmod 0644 /etc/sysctl.d/99-fd.conf
 
   mkdir -p /etc/systemd/system.conf.d
-  install -m 0644 /dev/stdin /etc/systemd/system.conf.d/99-limits.conf <<'EOF'
+  cat > /etc/systemd/system.conf.d/99-limits.conf <<'EOF'
 [Manager]
 DefaultLimitNOFILE=1048576
 DefaultTasksMax=infinity
 EOF
+  chmod 0644 /etc/systemd/system.conf.d/99-limits.conf
 
   runq "sysctl --system" sysctl --system || true
   runq "systemd daemon-reexec" systemctl daemon-reexec || true
@@ -280,38 +540,76 @@ tailscale_magicdns_full() {
   fi
 }
 
+tailscale_ipv4() {
+  if command -v tailscale >/dev/null 2>&1; then
+    tailscale ip -4 2>/dev/null | head -n1 || true
+  else
+    echo ""
+  fi
+}
+
+print_tailscale_summary() {
+  local ip4 dns service state
+  ip4="$(tailscale_ipv4 || true)"
+  dns="$(tailscale_magicdns_full || true)"
+  if systemctl is-active --quiet tailscaled 2>/dev/null; then service="active"; else service="inactive"; fi
+  state="not-authorized"
+  if [[ -n "$ip4" ]]; then state="authorized"; fi
+
+  echo "  tailscaled:     $service"
+  echo "  Tailscale state:$state"
+  echo "  Tailscale IPv4: ${ip4:-not assigned}"
+  echo "  Tailscale DNS:  ${dns:-not assigned}"
+}
+
 ensure_tailscale_up() {
-  if systemctl is-active --quiet tailscaled 2>/dev/null; then
-    local ip4=""
-    ip4="$(tailscale ip -4 2>/dev/null || true)"
-    if [[ -n "$ip4" ]]; then
-      ok "Tailscale already authorized and running"
-      return 0
-    fi
+  if ! command -v tailscale >/dev/null 2>&1; then
+    warn "tailscale binary not found after install attempt"
+    return 1
   fi
 
-  log "Running tailscale up --ssh (waiting for authorization)"
+  if systemctl list-unit-files tailscaled.service >/dev/null 2>&1; then
+    systemctl enable --now tailscaled >/dev/null 2>&1 || true
+  fi
+
+  local ip4=""
+  ip4="$(tailscale_ipv4 || true)"
+  if [[ -n "$ip4" ]]; then
+    ok "Tailscale already installed, authorized and running"
+    print_tailscale_summary
+    return 0
+  fi
+
+  ok "Tailscale installed, but this node is not authorized yet"
+  log "Running tailscale up --ssh --advertise-exit-node"
+
   set +e
-  tailscale up --ssh --advertise-exit-node | tee /tmp/tailscale-up.log
+  tailscale up --ssh --advertise-exit-node 2>&1 | tee /tmp/tailscale-up.log
   local rc=${PIPESTATUS[0]}
   set -e
-
-  if [[ $rc -ne 0 ]]; then
-    warn "tailscale up returned non-zero (rc=$rc). Continuing."
-  fi
 
   local url=""
   url="$(grep -Eo 'https://login\.tailscale\.com/[a-zA-Z0-9/_-]+' /tmp/tailscale-up.log | head -n1 || true)"
   if [[ -n "$url" ]]; then
     echo "Open to authorize: $url"
-  else
-    warn "Authorization URL not found (maybe already authorized)."
+  fi
+
+  if [[ $rc -ne 0 ]]; then
+    warn "tailscale up returned rc=$rc. If authorization URL was shown, authorize and continue."
   fi
 
   if _has_tty; then
     local _=""
     read_tty _ "Press Enter after authorizing this device in Tailscale..."
   fi
+
+  ip4="$(tailscale_ipv4 || true)"
+  if [[ -n "$ip4" ]]; then
+    ok "Tailscale authorized"
+  else
+    warn "Tailscale still has no IPv4 assigned"
+  fi
+  print_tailscale_summary
 }
 
 ###############################################################################
@@ -342,7 +640,7 @@ harden_sshd() {
   local drop_dir="/etc/ssh/sshd_config.d"
   mkdir -p "$drop_dir"
 
-  install -m 0644 /dev/stdin "${drop_dir}/99-initial-hardening.conf" <<EOF
+  cat > "${drop_dir}/99-initial-hardening.conf" <<EOF
 # Managed by initial.sh
 Port ${SSH_PORT}
 PermitRootLogin no
@@ -351,6 +649,7 @@ KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
 PubkeyAuthentication yes
 EOF
+  chmod 0644 "${drop_dir}/99-initial-hardening.conf"
 
   if command -v sshd >/dev/null 2>&1; then
     if sshd -t >/dev/null 2>&1; then
@@ -463,8 +762,12 @@ zsh_stack_for_root() {
     bash -lc 'yes | ~/.fzf/install --key-bindings --completion --no-bash --no-fish --no-update-rc' >/dev/null 2>&1 || true
   fi
 
-  [[ -f "${user_home}/.zshrc" ]] && cp "${user_home}/.zshrc" "${root_home}/.zshrc" || true
-  [[ -f "${user_home}/.p10k.zsh" ]] && cp "${user_home}/.p10k.zsh" "${root_home}/.p10k.zsh" || true
+  if [[ -f "${user_home}/.zshrc" && "$(readlink -f "${user_home}/.zshrc")" != "$(readlink -f "${root_home}/.zshrc" 2>/dev/null || true)" ]]; then
+    cp "${user_home}/.zshrc" "${root_home}/.zshrc" || true
+  fi
+  if [[ -f "${user_home}/.p10k.zsh" && "$(readlink -f "${user_home}/.p10k.zsh")" != "$(readlink -f "${root_home}/.p10k.zsh" 2>/dev/null || true)" ]]; then
+    cp "${user_home}/.p10k.zsh" "${root_home}/.p10k.zsh" || true
+  fi
   chown root:root "${root_home}/.zshrc" "${root_home}/.p10k.zsh" 2>/dev/null || true
 
   for zrc in "${root_home}/.zshrc"; do
@@ -486,32 +789,127 @@ zsh_stack_for_root() {
 }
 
 ###############################################################################
+# INTERACTIVE DEFAULTS
+###############################################################################
+interactive_defaults() {
+  [[ "${ORIGINAL_ARGC:-0}" == "0" ]] || return 0
+  _has_tty || return 0
+
+  section "Interactive setup"
+  echo "No arguments were provided. First I will collect all input values, then run the setup."
+
+  local current_host=""
+  current_host="$(hostname 2>/dev/null || true)"
+  read_tty NEW_HOST "Hostname [keep ${current_host}]: "
+
+  if [[ -z "${USER_NAME:-}" ]]; then
+    read_tty USER_NAME "User to create (empty = skip user creation, or pass user=<name>): "
+  fi
+
+  ask_yes_no RUN_TAILSCALE "Install/configure Tailscale" "y"
+  ask_yes_no REMNANODE "Install/configure RemnaNode stack" "y"
+
+  if [[ "${REMNANODE}" == "1" ]]; then
+    while [[ -z "${REMNANODE_DOMAIN:-}" ]]; do
+      read_tty REMNANODE_DOMAIN "Domain for TLS certificate: "
+      [[ -n "${REMNANODE_DOMAIN:-}" ]] || echo "Domain cannot be empty." >/dev/tty || true
+    done
+
+    # SECRET_KEY is mandatory. On reruns we can reuse existing one, but ask explicitly.
+    if [[ -z "${SECRET_KEY:-}" && -f /opt/remnanode/docker-compose.yml ]]; then
+      existing_secret="$(grep -E '^\s*-\s*SECRET_KEY=' /opt/remnanode/docker-compose.yml 2>/dev/null | head -n1 | sed -E 's/^\s*-\s*SECRET_KEY=//' || true)"
+      if [[ -n "${existing_secret:-}" ]]; then
+        echo "Existing RemnaNode SECRET_KEY found in docker-compose.yml." >/dev/tty || true
+        ask_yes_no __use_existing_secret "Use existing SECRET_KEY" "y"
+        if [[ "${__use_existing_secret}" == "1" ]]; then
+          SECRET_KEY="${existing_secret}"
+          ok "Existing remnanode SECRET_KEY preserved from docker-compose.yml"
+        fi
+      fi
+    fi
+
+    while [[ -z "${SECRET_KEY:-}" ]]; do
+      read_tty_silent SECRET_KEY "Paste RemnaNode SECRET_KEY (required, input hidden): "
+      echo "" >/dev/tty || true
+      [[ -n "${SECRET_KEY:-}" ]] || echo "SECRET_KEY cannot be empty." >/dev/tty || true
+    done
+  fi
+
+  echo ""
+  echo "Firewall mode:"
+  echo "  1) tailscale-only: no public ports except mandatory 80/443 for Remna/certbot; allow everything via tailscale0"
+  echo "  2) selected public ports + allow everything via tailscale0"
+  local fw_mode=""
+  read_tty fw_mode "Choose 1/2 [1]: "
+  fw_mode="${fw_mode:-1}"
+  case "$fw_mode" in
+    1)
+      TAILSCALE_ONLY="1"
+      OPEN_PORTS_RAW=""
+      PORTS_MODE="skip"
+      ;;
+    2)
+      TAILSCALE_ONLY="0"
+      ask_value_default OPEN_PORTS_RAW "Public external ports to open, space/comma separated. Do NOT include SSH unless public SSH is needed" "80 443 9443"
+      PORTS_MODE="ask"
+      ;;
+    *)
+      TAILSCALE_ONLY="1"
+      PORTS_MODE="skip"
+      ;;
+  esac
+
+  ask_yes_no ENABLE_UFW_NOW "Enable UFW immediately now (unsafe unless Tailscale/console access is confirmed)" "n"
+
+  echo ""
+  section "Configuration summary"
+  echo "  Hostname:      ${NEW_HOST:-<keep current>}"
+  echo "  User:          ${USER_NAME:-<skip>}"
+  echo "  Tailscale:     ${RUN_TAILSCALE}"
+  echo "  RemnaNode:     ${REMNANODE}"
+  echo "  Remna port:    2222"
+  echo "  Domain:        ${REMNANODE_DOMAIN:-<none>}"
+  echo "  SECRET_KEY:    $([[ -n "${SECRET_KEY:-}" ]] && echo configured || echo not-configured)"
+  echo "  Timezone:      Europe/Moscow"
+  echo "  DNS profile:   Cloudflare"
+  echo "  Firewall:      $([[ "${TAILSCALE_ONLY}" == "1" ]] && echo tailscale-only || echo selected-public-ports)"
+  echo "  Open ports:    ${OPEN_PORTS_RAW:-<none>}"
+  echo "  Enable UFW:    ${ENABLE_UFW_NOW}"
+
+  ask_yes_no __confirm "Continue" "y"
+  [[ "$__confirm" == "1" ]] || { echo "Aborted"; exit 1; }
+}
+
+###############################################################################
 # START
 ###############################################################################
 require_root
+interactive_defaults
+
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 
-log "Parameters: user='${USER_NAME:-<ask>}' timezone='${TIMEZONE}' reboot='${REBOOT_DELAY}' remnanode='${REMNANODE}' ssh_port='${SSH_PORT}' tuning='${RUN_TUNING}' dns-switch='${RUN_DNS_SWITCH}' dns-profile='${DNS_PROFILE:-<auto>}' tailscale='${RUN_TAILSCALE}'"
+###############################################################################
+# Fixed timezone
+###############################################################################
+log "Timezone: Europe/Moscow"
+runq "set timezone Europe/Moscow" timedatectl set-timezone Europe/Moscow || warn "Failed to set timezone — continuing"
 
-if [[ -z "${USER_NAME}" ]]; then
-  if _has_tty; then
-    read_tty USER_NAME "Enter username to create (e.g., akadorkin): "
-  fi
-  [[ -n "$USER_NAME" ]] || { err "Username is empty (provide --user)"; exit 1; }
+log "Parameters: user='${USER_NAME:-<skip>}' remnanode='${REMNANODE}' remna_port='2222' ssh_port='22' timezone='Europe/Moscow' tuning='always' dns-switch='1' dns-profile='Cloudflare' tailscale='${RUN_TAILSCALE}'"
+
+if [[ -n "${USER_NAME:-}" ]]; then
+  ok "User: $USER_NAME"
+  HOME_DIR="/home/${USER_NAME}"
+else
+  warn "User creation skipped"
+  HOME_DIR=""
 fi
-ok "User: $USER_NAME"
-HOME_DIR="/home/${USER_NAME}"
 
 ###############################################################################
-# Step 0: hostname
+# Step 1: hostname
 ###############################################################################
-log "Step 0: hostname"
+log "Step 1: hostname"
 CURRENT_HOST="$(hostname 2>/dev/null || true)"
-NEW_HOST=""
-if _has_tty; then
-  read_tty NEW_HOST "Enter hostname (press Enter to keep '${CURRENT_HOST}'): "
-fi
 if [[ -n "${NEW_HOST:-}" ]]; then
   runq "hostnamectl set-hostname" hostnamectl set-hostname "${NEW_HOST}" || true
   ok "Hostname set to: ${NEW_HOST}"
@@ -520,10 +918,10 @@ else
 fi
 
 ###############################################################################
-# Step 1: tailscale install
+# Step 2: tailscale install/status
 ###############################################################################
 if [[ "${RUN_TAILSCALE}" == "1" ]]; then
-  log "Step 1: tailscale install"
+  log "Step 2: tailscale install/status"
 
   aptq "APT update" update
   aptq "Install base packages for tailscale step" install curl jq ca-certificates iproute2 ethtool
@@ -536,12 +934,13 @@ if [[ "${RUN_TAILSCALE}" == "1" ]]; then
     ok "Tailscale already installed — skipping install"
   fi
 
-  install -m 0644 /dev/stdin /etc/sysctl.d/99-tailscale-forwarding.conf <<'EOF'
+  cat > /etc/sysctl.d/99-tailscale-forwarding.conf <<'EOF'
 net.ipv4.ip_forward=1
 net.ipv6.conf.all.forwarding=1
 net.ipv4.conf.all.rp_filter=0
 net.ipv4.conf.default.rp_filter=0
 EOF
+  chmod 0644 /etc/sysctl.d/99-tailscale-forwarding.conf
   runq "sysctl --system" sysctl --system || true
 
   if [[ -n "${INTERNET_IFACE:-}" ]]; then
@@ -554,57 +953,363 @@ EOF
   TS_IP_EARLY="$(tailscale ip -4 2>/dev/null || true)"
   TS_DNS_EARLY="$(tailscale_magicdns_full || true)"
 
-  section "🛡️ Tailscale authorized"
+  section "Tailscale status"
   echo "  Tailscale IPv4: ${TS_IP_EARLY:-not assigned}"
   echo "  Tailscale DNS:  ${TS_DNS_EARLY:-not assigned}"
 else
-  warn "Step 1: tailscale skipped (--tailscale=${RUN_TAILSCALE})"
+  warn "Step 2: tailscale skipped (--tailscale=${RUN_TAILSCALE})"
 fi
 
+
+
 ###############################################################################
-# Step 2: remnanode parameters
+# REMNANODE EXTRAS: domain, DNS, certbot, geo updater, compose volumes
+###############################################################################
+valid_fqdn() {
+  local d="${1:-}"
+  [[ "$d" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]
+}
+
+public_ipv4() {
+  curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null \
+    || curl -4 -fsS --max-time 6 https://ifconfig.me 2>/dev/null \
+    || curl -4 -fsS --max-time 6 https://icanhazip.com 2>/dev/null \
+    || true
+}
+
+resolve_a_records() {
+  local domain="$1"
+  dig +short A "$domain" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$' || true
+}
+
+prompt_remnanode_domain() {
+  [[ "${REMNANODE}" == "1" ]] || return 0
+
+  if [[ -z "${REMNANODE_DOMAIN:-}" && _has_tty ]]; then
+    read_tty REMNANODE_DOMAIN "Enter remnanode TLS domain for certbot (e.g. s1.proj432.co): "
+  fi
+
+  if [[ -z "${REMNANODE_DOMAIN:-}" ]]; then
+    err "Domain is empty — provide --domain or run interactively"
+    REMNANODE="0"
+    return 0
+  fi
+
+  if ! valid_fqdn "${REMNANODE_DOMAIN}"; then
+    err "Invalid domain: ${REMNANODE_DOMAIN}"
+    REMNANODE="0"
+    return 0
+  fi
+
+  ok "Remnanode domain: ${REMNANODE_DOMAIN}"
+}
+
+wait_for_domain_dns() {
+  [[ "${REMNANODE}" == "1" ]] || return 0
+  [[ -n "${REMNANODE_DOMAIN:-}" ]] || return 0
+
+  local expected_ip=""
+  expected_ip="$(public_ipv4)"
+  if [[ -z "$expected_ip" ]]; then
+    err "Could not detect public IPv4; cannot verify DNS for ${REMNANODE_DOMAIN}"
+    exit 1
+  fi
+
+  local timeout_sec=300
+  local interval_sec=5
+  local elapsed=0
+
+  log "Waiting for DNS A record: ${REMNANODE_DOMAIN} -> ${expected_ip}"
+  log "Timeout: ${timeout_sec}s, interval: ${interval_sec}s"
+
+  while (( elapsed <= timeout_sec )); do
+    local records=""
+    records="$(resolve_a_records "${REMNANODE_DOMAIN}" || true)"
+
+    local one_line="${records//$'\n'/ }"
+    [[ -n "$one_line" ]] || one_line="EMPTY"
+    echo "[${elapsed}/${timeout_sec}s] DNS A: ${one_line}"
+
+    if grep -qxF "$expected_ip" <<< "$records"; then
+      ok "DNS is ready: ${REMNANODE_DOMAIN} -> ${expected_ip}"
+      return 0
+    fi
+
+    sleep "$interval_sec"
+    elapsed=$((elapsed + interval_sec))
+  done
+
+  err "DNS for ${REMNANODE_DOMAIN} still does not point to ${expected_ip} after ${timeout_sec}s"
+  exit 1
+}
+
+install_roscomvpn_geo_updater() {
+  log "Installing roscomvpn geo updater + 4h systemd timer"
+
+  cat > /usr/local/sbin/update-roscomvpn-geo.sh <<'GEO_SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DIR="/opt/remnanode"
+GEOIP_URL="https://cdn.jsdelivr.net/gh/hydraponique/roscomvpn-geoip@202604220533/release/geoip.dat"
+GEOSITE_URL="https://cdn.jsdelivr.net/gh/hydraponique/roscomvpn-geosite@202604152235/release/geosite.dat"
+
+mkdir -p "$DIR"
+cd "$DIR"
+
+curl -fL --retry 3 --connect-timeout 10 -o roscomvpn-geoip.dat.tmp "$GEOIP_URL"
+curl -fL --retry 3 --connect-timeout 10 -o roscomvpn-geosite.dat.tmp "$GEOSITE_URL"
+
+test -s roscomvpn-geoip.dat.tmp
+test -s roscomvpn-geosite.dat.tmp
+
+mv -f roscomvpn-geoip.dat.tmp roscomvpn-geoip.dat
+mv -f roscomvpn-geosite.dat.tmp roscomvpn-geosite.dat
+GEO_SCRIPT
+  chmod 0755 /usr/local/sbin/update-roscomvpn-geo.sh
+
+  cat > /etc/systemd/system/update-roscomvpn-geo.service <<'GEO_SERVICE'
+[Unit]
+Description=Update roscomvpn geoip/geosite data
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/update-roscomvpn-geo.sh
+GEO_SERVICE
+  chmod 0644 /etc/systemd/system/update-roscomvpn-geo.service
+
+  cat > /etc/systemd/system/update-roscomvpn-geo.timer <<'GEO_TIMER'
+[Unit]
+Description=Run roscomvpn geo updater every 4 hours
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=4h
+AccuracySec=5min
+Persistent=true
+Unit=update-roscomvpn-geo.service
+
+[Install]
+WantedBy=timers.target
+GEO_TIMER
+  chmod 0644 /etc/systemd/system/update-roscomvpn-geo.timer
+
+  systemctl daemon-reload
+  systemctl enable --now update-roscomvpn-geo.timer >/dev/null 2>&1 || true
+  systemctl start update-roscomvpn-geo.service || warn "roscomvpn geo initial update failed — continuing"
+  ok "roscomvpn geo updater installed"
+}
+
+normalize_remnanode_compose_volumes() {
+  local compose="/opt/remnanode/docker-compose.yml"
+  [[ -f "$compose" ]] || return 0
+
+  log "Normalizing remnanode compose volumes"
+  cp "$compose" "${compose}.bak.$(date +%F-%H%M%S)" || true
+
+  python3 - "$compose" <<'COMPOSE_PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+s = path.read_text()
+required = [
+    "      - './roscomvpn-geosite.dat:/usr/local/share/xray/roscomvpn-geosite.dat:ro'",
+    "      - './roscomvpn-geoip.dat:/usr/local/share/xray/roscomvpn-geoip.dat:ro'",
+    "      - '/opt/certbot/certs:/etc/letsencrypt:ro'",
+    "      - '/var/log/remnanode:/var/log/remnanode'",
+]
+new_block = "    volumes:\n" + "\n".join(required) + "\n"
+
+m = re.search(r'(?ms)^    volumes:\n(?:^      - .+\n)*', s)
+if m:
+    s = s[:m.start()] + new_block + s[m.end():]
+else:
+    marker = re.search(r'(?m)^    environment:\n(?:^      - .+\n)+', s)
+    if marker:
+        s = s[:marker.end()] + new_block + s[marker.end():]
+    else:
+        s = s.rstrip() + "\n" + new_block
+
+path.write_text(s)
+COMPOSE_PY
+
+  docker compose -f "$compose" config >/dev/null
+  ok "Compose volumes normalized"
+}
+
+
+normalize_remnanode_compose_environment() {
+  local compose="/opt/remnanode/docker-compose.yml"
+  [[ "${REMNANODE}" == "1" ]] || return 0
+  [[ -f "$compose" ]] || return 0
+  [[ -n "${SECRET_KEY:-}" ]] || { err "SECRET_KEY is empty — cannot normalize remnanode compose environment"; exit 1; }
+
+  log "Normalizing remnanode compose environment"
+  cp "$compose" "${compose}.compose-env.bak.$(date +%F-%H%M%S)" || true
+
+  SECRET_KEY_ENV="${SECRET_KEY}" NODE_PORT_ENV="${NODE_PORT}" python3 - "$compose" <<'COMPOSE_ENV_PY'
+from pathlib import Path
+import os
+import re
+import sys
+
+path = Path(sys.argv[1])
+s = path.read_text()
+secret = os.environ["SECRET_KEY_ENV"]
+node_port = os.environ.get("NODE_PORT_ENV", "2222")
+new_block = f"    environment:\n      - NODE_PORT={node_port}\n      - SECRET_KEY={secret}\n"
+
+m = re.search(r'(?ms)^    environment:\n(?:^      - .+\n)*', s)
+if m:
+    s = s[:m.start()] + new_block + s[m.end():]
+else:
+    marker = re.search(r'(?m)^    volumes:\n', s)
+    if marker:
+        s = s[:marker.start()] + new_block + s[marker.start():]
+    else:
+        s = s.rstrip() + "\n" + new_block
+
+path.write_text(s)
+COMPOSE_ENV_PY
+
+
+  docker compose -f "$compose" config >/dev/null
+  ok "Compose environment normalized: NODE_PORT=${NODE_PORT}, SECRET_KEY=<configured>"
+}
+
+issue_remnanode_certificate() {
+  [[ "${REMNANODE}" == "1" ]] || return 0
+  [[ -n "${REMNANODE_DOMAIN:-}" ]] || return 0
+
+  log "Issuing/renewing Docker certbot certificate for ${REMNANODE_DOMAIN}"
+
+  mkdir -p /opt/certbot
+  cd /opt/certbot
+
+  cat > docker-compose.yml <<'CERTBOT_COMPOSE'
+services:
+  certbot:
+    container_name: certbot
+    image: certbot/certbot
+    network_mode: host
+    volumes:
+      - ./certs:/etc/letsencrypt
+      - ./var-lib-letsencrypt:/var/lib/letsencrypt
+CERTBOT_COMPOSE
+
+  # Always allow public cert/service ports. HTTP-01 needs 80/tcp; 443 is kept open for TLS/XHTTP.
+  ufw allow 80/tcp >/dev/null 2>&1 || true
+  ufw allow 443/tcp >/dev/null 2>&1 || true
+  ufw allow 443/udp >/dev/null 2>&1 || true
+  iptables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 80 -j ACCEPT || true
+  iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 443 -j ACCEPT || true
+  iptables -C INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport 443 -j ACCEPT || true
+  ip6tables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p tcp --dport 80 -j ACCEPT || true
+  ip6tables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p tcp --dport 443 -j ACCEPT || true
+  ip6tables -C INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport 443 -j ACCEPT || true
+
+  docker run --rm \
+    -v /opt/certbot/certs:/etc/letsencrypt \
+    -v /opt/certbot/var-lib-letsencrypt:/var/lib/letsencrypt \
+    --network host \
+    certbot/certbot certonly --standalone \
+    --non-interactive --agree-tos \
+    --email admin@proj432.co \
+    --cert-name remnanode \
+    -d "${REMNANODE_DOMAIN}"
+
+  ls -l /opt/certbot/certs/live/remnanode/ || true
+
+  (
+    crontab -l 2>/dev/null | grep -v '/opt/certbot && docker compose run --rm certbot renew' || true
+    echo '0 0 28 * * cd /opt/certbot && docker compose run --rm certbot renew >/dev/null 2>&1'
+  ) | crontab -
+
+  ok "Certificate ready: /etc/letsencrypt/live/remnanode/fullchain.pem"
+}
+
+###############################################################################
+# Step 3: remnanode parameters
 ###############################################################################
 if [[ "${REMNANODE}" == "1" ]]; then
-  log "Step 2: remnanode parameters"
-  if _has_tty; then
-    read_tty_silent SECRET_KEY "Paste SECRET_KEY (input hidden): "
-  else
-    warn "/dev/tty is not available — cannot prompt for remnanode parameters"
+  log "Step 3: remnanode parameters"
+
+  # SECRET_KEY is mandatory. On reruns we can reuse existing one, but ask explicitly when TTY is available.
+  if [[ -z "${SECRET_KEY:-}" && -f /opt/remnanode/docker-compose.yml ]]; then
+    existing_secret="$(grep -E '^\s*-\s*SECRET_KEY=' /opt/remnanode/docker-compose.yml 2>/dev/null | head -n1 | sed -E 's/^\s*-\s*SECRET_KEY=//' || true)"
+    if [[ -n "${existing_secret:-}" ]]; then
+      if _has_tty; then
+        echo "Existing RemnaNode SECRET_KEY found in docker-compose.yml." >/dev/tty || true
+        ask_yes_no __use_existing_secret_runtime "Use existing SECRET_KEY" "y"
+        if [[ "${__use_existing_secret_runtime}" == "1" ]]; then
+          SECRET_KEY="${existing_secret}"
+          ok "Existing remnanode SECRET_KEY preserved from docker-compose.yml"
+        fi
+      else
+        SECRET_KEY="${existing_secret}"
+        ok "Existing remnanode SECRET_KEY preserved from docker-compose.yml"
+      fi
+    fi
   fi
 
-  if [[ -z "${SECRET_KEY:-}" ]]; then
-    err "SECRET_KEY is empty — remnanode compose will not be created"
-    REMNANODE="0"
-  else
-    ok "remnanode parameters received"
-  fi
+  while [[ -z "${SECRET_KEY:-}" ]]; do
+    if _has_tty; then
+      read_tty_silent SECRET_KEY "Paste RemnaNode SECRET_KEY (required, input hidden): "
+      echo "" >/dev/tty || true
+    else
+      err "SECRET_KEY is required for RemnaNode. Pass --secret-key '<key>' or secret_key='<key>'."
+      exit 1
+    fi
+
+    if [[ -z "${SECRET_KEY:-}" ]]; then
+      echo "SECRET_KEY cannot be empty." >/dev/tty || true
+    fi
+  done
+
+  ok "RemnaNode SECRET_KEY received"
 else
-  warn "Step 2: remnanode parameters skipped (--remnanode=${REMNANODE})"
+  warn "Step 3: remnanode parameters skipped (--remnanode=${REMNANODE})"
 fi
 
+prompt_remnanode_domain
+
 ###############################################################################
-# Step 3: base packages and core setup
+# Step 4: base packages and core setup
 ###############################################################################
-log "Step 3: base packages and core setup"
+log "Step 4: base packages and core setup"
 
 aptq "APT update" update
 aptq "APT upgrade" upgrade
 aptq "Install base packages" install \
   zsh git curl wget ca-certificates gnupg lsb-release apt-transport-https \
   iproute2 ufw htop mc cron ed openssl logrotate jq iperf3 ethtool \
-  dnsutils acl fail2ban
+  dnsutils acl fail2ban python3 haproxy
 
 runq "enable cron" systemctl enable --now cron >/dev/null 2>&1 || true
 grep -q '^/usr/bin/zsh$' /etc/shells || echo '/usr/bin/zsh' >> /etc/shells
 
-apply_fd_limits
-
-log "Configuring timezone -> ${TIMEZONE}"
-runq "link /etc/localtime" ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime || true
-runq "timedatectl set-timezone" timedatectl set-timezone "${TIMEZONE}" || true
-ok "Timezone configured"
+# FD limits and network tuning are handled by external tuning script below.
 
 pick_open_ports
+ensure_cert_public_ports
+
+###############################################################################
+# TUNING (external, non-interactive)
+###############################################################################
+if [[ "${RUN_TUNING}" == "1" ]]; then
+  log "Kernel/network tuning (external) — apply"
+  if curl -fsSL https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/main/initial.sh | bash -s -- apply; then
+    ok "External tuning applied"
+  else
+    warn "External tuning failed — continuing"
+  fi
+else
+  warn "Tuning skipped (--tuning=${RUN_TUNING})"
+fi
 
 ###############################################################################
 # DOCKER
@@ -628,73 +1333,87 @@ fi
 # USER + SSH
 ###############################################################################
 log "User and SSH setup"
-PASS_GEN=""
-PASS_FILE="/root/initial-user-password.txt"
-PASS_CREATED="0"
 
-if id -u "${USER_NAME}" >/dev/null 2>&1; then
-  ok "User ${USER_NAME} exists — not creating"
-else
-  PASS_GEN="$(openssl rand -base64 16)"
-  runq "useradd ${USER_NAME}" useradd -m -s /usr/bin/zsh "${USER_NAME}"
-  runq "set user password" bash -lc "echo '${USER_NAME}:${PASS_GEN}' | chpasswd"
-  PASS_CREATED="1"
-  ok "Created user ${USER_NAME}"
-fi
+if [[ -n "${USER_NAME:-}" ]]; then
+  PASS_GEN=""
+  PASS_FILE="/root/initial-user-password.txt"
+  PASS_CREATED="0"
 
-runq "set user shell zsh" chsh -s /usr/bin/zsh "${USER_NAME}" || true
-runq "add to sudo,docker" usermod -aG sudo,docker "${USER_NAME}" || true
+  if id -u "${USER_NAME}" >/dev/null 2>&1; then
+    ok "User ${USER_NAME} exists — not creating"
+  else
+    PASS_GEN="$(openssl rand -base64 16)"
+    runq "useradd ${USER_NAME}" useradd -m -s /usr/bin/zsh "${USER_NAME}"
+    runq "set user password" bash -lc "echo '${USER_NAME}:${PASS_GEN}' | chpasswd"
+    PASS_CREATED="1"
+    ok "Created user ${USER_NAME}"
+  fi
 
-install -m 0440 /dev/stdin "/etc/sudoers.d/${USER_NAME}" <<EOF
+  runq "set user shell zsh" chsh -s /usr/bin/zsh "${USER_NAME}" || true
+  runq "add to sudo,docker" usermod -aG sudo,docker "${USER_NAME}" || true
+
+  mkdir -p /etc/sudoers.d
+  cat > "/etc/sudoers.d/${USER_NAME}" <<EOF
 ${USER_NAME} ALL=(ALL) NOPASSWD:ALL
 EOF
+  chmod 0440 "/etc/sudoers.d/${USER_NAME}"
 
-runq "mkdir ~/.ssh" mkdir -p "${HOME_DIR}/.ssh"
-runq "chmod 700 ~/.ssh" chmod 700 "${HOME_DIR}/.ssh"
+  HOME_DIR="/home/${USER_NAME}"
+  if [[ ! -d "${HOME_DIR}" ]]; then
+    mkdir -p "${HOME_DIR}"
+    chown "${USER_NAME}:${USER_NAME}" "${HOME_DIR}" || true
+  fi
+  runq "mkdir ~/.ssh" mkdir -p "${HOME_DIR}/.ssh"
+  runq "chmod 700 ~/.ssh" chmod 700 "${HOME_DIR}/.ssh"
 
-AUTH_SRC=""
-if [[ -f /root/.ssh/authorized_keys && -s /root/.ssh/authorized_keys ]]; then
-  AUTH_SRC="/root/.ssh/authorized_keys"
-elif [[ -f /home/ubuntu/.ssh/authorized_keys && -s /home/ubuntu/.ssh/authorized_keys ]]; then
-  AUTH_SRC="/home/ubuntu/.ssh/authorized_keys"
-fi
+  AUTH_SRC=""
+  if [[ -f /root/.ssh/authorized_keys && -s /root/.ssh/authorized_keys ]]; then
+    AUTH_SRC="/root/.ssh/authorized_keys"
+  elif [[ -f /home/ubuntu/.ssh/authorized_keys && -s /home/ubuntu/.ssh/authorized_keys ]]; then
+    AUTH_SRC="/home/ubuntu/.ssh/authorized_keys"
+  fi
 
-if [[ -n "$AUTH_SRC" ]]; then
-  runq "copy authorized_keys from ${AUTH_SRC}" install -m 0600 "$AUTH_SRC" "${HOME_DIR}/.ssh/authorized_keys"
-  runq "chown ~/.ssh" chown -R "${USER_NAME}:${USER_NAME}" "${HOME_DIR}/.ssh"
-  ok "SSH keys copied -> ${HOME_DIR}/.ssh/authorized_keys"
-else
-  warn "authorized_keys not found for root or ubuntu — SSH keys were NOT copied to ${USER_NAME}"
-fi
+  if [[ -n "$AUTH_SRC" ]]; then
+    runq "copy authorized_keys from ${AUTH_SRC}" install -m 0600 "$AUTH_SRC" "${HOME_DIR}/.ssh/authorized_keys"
+    runq "chown ~/.ssh" chown -R "${USER_NAME}:${USER_NAME}" "${HOME_DIR}/.ssh"
+    ok "SSH keys copied -> ${HOME_DIR}/.ssh/authorized_keys"
+  else
+    warn "authorized_keys not found for root or ubuntu — SSH keys were NOT copied to ${USER_NAME}"
+  fi
 
-if [[ "${PASS_CREATED}" == "1" ]]; then
-  section "🔐 New user credentials"
-  echo "  User:     ${USER_NAME}"
-  echo "  Password: ${PASS_GEN}"
-  printf "%s:%s\n" "${USER_NAME}:${PASS_GEN}" > "${PASS_FILE}"
-  chmod 600 "${PASS_FILE}" || true
-  ok "Saved credentials to: ${PASS_FILE} (root-only)"
-fi
+  if [[ "${PASS_CREATED}" == "1" ]]; then
+    section "🔐 New user credentials"
+    echo "  User:     ${USER_NAME}"
+    echo "  Password: ${PASS_GEN}"
+    printf "%s:%s
+" "${USER_NAME}:${PASS_GEN}" > "${PASS_FILE}"
+    chmod 600 "${PASS_FILE}" || true
+    ok "Saved credentials to: ${PASS_FILE} (root-only)"
+  fi
 
-mkdir -p /opt
-setfacl -R -m "u:${USER_NAME}:rwX" /opt || true
-setfacl -R -d -m "u:${USER_NAME}:rwX" /opt || true
-ok "ACL applied on /opt for ${USER_NAME}"
+  mkdir -p /opt
+  setfacl -R -m "u:${USER_NAME}:rwX" /opt || true
+  setfacl -R -d -m "u:${USER_NAME}:rwX" /opt || true
+  ok "ACL applied on /opt for ${USER_NAME}"
 
-for rc in "${HOME_DIR}/.bashrc" "${HOME_DIR}/.zshrc"; do
-  touch "$rc"
-  if ! grep -q "alias apt='sudo apt'" "$rc" 2>/dev/null; then
-    cat >> "$rc" <<'EOF'
+  for rc in "${HOME_DIR}/.bashrc" "${HOME_DIR}/.zshrc"; do
+    touch "$rc"
+    if ! grep -q "alias apt='sudo apt'" "$rc" 2>/dev/null; then
+      cat >> "$rc" <<'EOF'
 alias apt='sudo apt'
 alias apt-get='sudo apt-get'
 EOF
-  fi
-  chown "${USER_NAME}:${USER_NAME}" "$rc" || true
-done
-ok "apt aliases added for ${USER_NAME}"
+    fi
+    chown "${USER_NAME}:${USER_NAME}" "$rc" || true
+  done
+  ok "apt aliases added for ${USER_NAME}"
 
-zsh_stack_for_user "${USER_NAME}" "${HOME_DIR}" || warn "Zsh stack for ${USER_NAME} failed — continuing"
-zsh_stack_for_root "${HOME_DIR}" || warn "Zsh stack for root failed — continuing"
+  zsh_stack_for_user "${USER_NAME}" "${HOME_DIR}" || warn "Zsh stack for ${USER_NAME} failed — continuing"
+  zsh_stack_for_root "${HOME_DIR}" || warn "Zsh stack for root failed — continuing"
+else
+  warn "User creation skipped"
+  zsh_stack_for_root "/root" || warn "Zsh stack for root failed — continuing"
+fi
 
 harden_sshd
 
@@ -711,10 +1430,12 @@ else
     runq "mkdir /opt/remnanode" mkdir -p /opt/remnanode
 
     mkdir -p /var/log/remnanode
-    setfacl -R -m "u:${USER_NAME}:rwX" /var/log/remnanode || true
-    setfacl -R -d -m "u:${USER_NAME}:rwX" /var/log/remnanode || true
+    if [[ -n "${USER_NAME:-}" ]]; then
+      setfacl -R -m "u:${USER_NAME}:rwX" /var/log/remnanode || true
+      setfacl -R -d -m "u:${USER_NAME}:rwX" /var/log/remnanode || true
+    fi
 
-    install -m 0644 /dev/stdin "${REMNA_COMPOSE}" <<EOF
+    cat > "${REMNA_COMPOSE}" <<EOF
 services:
   remnanode:
     container_name: remnanode
@@ -729,18 +1450,30 @@ services:
         soft: 1048576
         hard: 1048576
     environment:
-      - NODE_PORT=2222
+      - NODE_PORT=${NODE_PORT}
       - SECRET_KEY=${SECRET_KEY}
     volumes:
+      - './roscomvpn-geosite.dat:/usr/local/share/xray/roscomvpn-geosite.dat:ro'
+      - './roscomvpn-geoip.dat:/usr/local/share/xray/roscomvpn-geoip.dat:ro'
+      - '/opt/certbot/certs:/etc/letsencrypt:ro'
       - '/var/log/remnanode:/var/log/remnanode'
 EOF
+    chmod 0644 "${REMNA_COMPOSE}"
     ok "Created remnanode compose: ${REMNA_COMPOSE}"
   else
     warn "remnanode compose is missing, but REMNANODE=0 — skipping generation"
   fi
 fi
 
-install -m 0644 /dev/stdin /etc/logrotate.d/remnanode <<'EOF'
+if [[ -f "${REMNA_COMPOSE}" ]]; then
+  normalize_remnanode_compose_environment
+  normalize_remnanode_compose_volumes
+  install_roscomvpn_geo_updater
+  wait_for_domain_dns
+  issue_remnanode_certificate
+fi
+
+cat > /etc/logrotate.d/remnanode <<'EOF'
 /var/log/remnanode/*.log {
     daily
     rotate 7
@@ -753,6 +1486,7 @@ install -m 0644 /dev/stdin /etc/logrotate.d/remnanode <<'EOF'
     create 0640 root adm
 }
 EOF
+chmod 0644 /etc/logrotate.d/remnanode
 ok "logrotate for /var/log/remnanode installed"
 
 ###############################################################################
@@ -763,12 +1497,13 @@ log "Configuring Fail2ban (sshd + sshd-fast + recidive, incremental bantime)"
 touch /var/log/fail2ban.log
 chmod 640 /var/log/fail2ban.log || true
 
-install -m 0644 /dev/stdin /etc/fail2ban/fail2ban.local <<'EOF'
+cat > /etc/fail2ban/fail2ban.local <<'EOF'
 [Definition]
 logtarget = /var/log/fail2ban.log
 EOF
+chmod 0644 /etc/fail2ban/fail2ban.local
 
-install -m 0644 /dev/stdin /etc/fail2ban/jail.d/00-defaults.local <<'EOF'
+cat > /etc/fail2ban/jail.d/00-defaults.local <<'EOF'
 [DEFAULT]
 banaction = ufw
 backend   = systemd
@@ -786,15 +1521,17 @@ ignoreip = 127.0.0.1/8 ::1 100.64.0.0/10
 
 usedns = warn
 EOF
+chmod 0644 /etc/fail2ban/jail.d/00-defaults.local
 
-install -m 0644 /dev/stdin /etc/fail2ban/jail.d/sshd.local <<EOF
+cat > /etc/fail2ban/jail.d/sshd.local <<EOF
 [sshd]
 enabled = true
 port    = ${SSH_PORT}
 mode    = aggressive
 EOF
+chmod 0644 /etc/fail2ban/jail.d/sshd.local
 
-install -m 0644 /dev/stdin /etc/fail2ban/jail.d/sshd-fast.local <<EOF
+cat > /etc/fail2ban/jail.d/sshd-fast.local <<EOF
 [sshd-fast]
 enabled  = true
 filter   = sshd
@@ -806,8 +1543,9 @@ findtime = 2m
 maxretry = 2
 bantime  = 12h
 EOF
+chmod 0644 /etc/fail2ban/jail.d/sshd-fast.local
 
-install -m 0644 /dev/stdin /etc/fail2ban/jail.d/recidive.local <<'EOF'
+cat > /etc/fail2ban/jail.d/recidive.local <<'EOF'
 [recidive]
 enabled  = true
 logpath  = /var/log/fail2ban.log
@@ -815,6 +1553,7 @@ findtime = 7d
 maxretry = 3
 bantime  = 4w
 EOF
+chmod 0644 /etc/fail2ban/jail.d/recidive.local
 
 runq "enable fail2ban"  systemctl enable --now fail2ban
 runq "restart fail2ban" systemctl restart fail2ban
@@ -824,7 +1563,7 @@ runq "restart fail2ban" systemctl restart fail2ban
 ###############################################################################
 log "Installing rugov nftables input-only blacklist updater"
 
-install -m 0755 /dev/stdin /usr/local/sbin/update-rugov-nftables <<'EOF'
+cat > /usr/local/sbin/update-rugov-nftables <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -860,12 +1599,14 @@ nft add rule inet filter rugov_input ip6 saddr @blacklist_v6 counter reject
 
 nft delete chain inet filter rugov_output 2>/dev/null || true
 EOF
+chmod 0755 /usr/local/sbin/update-rugov-nftables
 
-install -m 0644 /dev/stdin /etc/cron.d/update-rugov-nftables <<'EOF'
+cat > /etc/cron.d/update-rugov-nftables <<'EOF'
 0 2 * * * root /usr/local/sbin/update-rugov-nftables >> /var/log/update-rugov-nftables.log 2>&1
 EOF
+chmod 0644 /etc/cron.d/update-rugov-nftables
 
-install -m 0644 /dev/stdin /etc/logrotate.d/update-rugov-nftables <<'EOF'
+cat > /etc/logrotate.d/update-rugov-nftables <<'EOF'
 /var/log/update-rugov-nftables.log {
     daily
     rotate 14
@@ -877,6 +1618,7 @@ install -m 0644 /dev/stdin /etc/logrotate.d/update-rugov-nftables <<'EOF'
     create 0640 root adm
 }
 EOF
+chmod 0644 /etc/logrotate.d/update-rugov-nftables
 
 runq "apply rugov nftables now" bash -lc '/usr/local/sbin/update-rugov-nftables >> /var/log/update-rugov-nftables.log 2>&1'
 
@@ -923,17 +1665,27 @@ else
   fi
 
   if ip link show tailscale0 >/dev/null 2>&1; then
+    # Trust the private tailnet completely: every inbound/outbound protocol and port.
     ufw allow in on tailscale0  >/dev/null 2>&1 || true
     ufw allow out on tailscale0 >/dev/null 2>&1 || true
-    ufw allow in on tailscale0 to any port "${SSH_PORT}" proto tcp >/dev/null 2>&1 || true
+
+    # Also add raw iptables accepts so tailscale traffic survives strict UFW/default policies.
+    iptables -C INPUT -i tailscale0 -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -i tailscale0 -j ACCEPT || true
+    iptables -C OUTPUT -o tailscale0 -j ACCEPT 2>/dev/null || iptables -I OUTPUT 1 -o tailscale0 -j ACCEPT || true
+    ip6tables -C INPUT -i tailscale0 -j ACCEPT 2>/dev/null || ip6tables -I INPUT 1 -i tailscale0 -j ACCEPT || true
+    ip6tables -C OUTPUT -o tailscale0 -j ACCEPT 2>/dev/null || ip6tables -I OUTPUT 1 -o tailscale0 -j ACCEPT || true
+
+    ok "tailscale0 is fully allowed"
   fi
 
-  if [[ "${RUN_TAILSCALE}" == "1" ]]; then
-    ufw deny in on "${INTERNET_IFACE}" to any port "${SSH_PORT}" proto tcp >/dev/null 2>&1 || true
-    ok "SSH is restricted to tailscale0 only"
+  # External interface policy: only OPEN_PORTS are allowed.
+  # SSH is intentionally not opened by default; add ${SSH_PORT} to --open-ports if public SSH is required.
+  if printf ' %s ' "${OPEN_PORTS[@]}" | grep -q " ${SSH_PORT} "; then
+    ok "Public SSH is explicitly allowed via open ports: ${SSH_PORT}/tcp+udp"
   else
-    warn "tailscale disabled — leaving public SSH open on ${SSH_PORT}/tcp"
-    ufw allow in on "${INTERNET_IFACE}" to any port "${SSH_PORT}" proto tcp >/dev/null 2>&1 || true
+    ufw deny in on "${INTERNET_IFACE}" to any port "${SSH_PORT}" proto tcp >/dev/null 2>&1 || true
+    ufw deny in on "${INTERNET_IFACE}" to any port "${SSH_PORT}" proto udp >/dev/null 2>&1 || true
+    ok "Public SSH is closed; SSH remains available over tailscale0 if Tailscale is up"
   fi
 
   for rule in \
@@ -951,14 +1703,15 @@ else
     ufw deny out "$rule" >/dev/null 2>&1 || true
   done
 
-  case "${REBOOT_DELAY}" in
-    0|no|none|skip|"")
-      warn "Reboot disabled — UFW rules staged, but firewall remains disabled to avoid lockout"
-      ;;
-    *)
-      runq "ufw enable" ufw --force enable
-      ;;
-  esac
+  # Safety: never enable UFW automatically by default. This prevents public SSH lockout.
+  # Rules are staged in UFW; enable manually after confirming Tailscale/console access:
+  #   sudo ufw --force enable
+  if [[ "${ENABLE_UFW_NOW:-0}" == "1" ]]; then
+    warn "--enable-ufw-now=1 was requested; enabling UFW now"
+    runq "ufw enable" ufw --force enable
+  else
+    warn "UFW rules staged but NOT enabled to avoid lockout. Enable later with: sudo ufw --force enable"
+  fi
 fi
 
 ###############################################################################
@@ -980,7 +1733,7 @@ node_exporter_install() {
   tar -xzf "/root/${ARCHIVE}" -C /root
   mv "/root/${EXTRACT_DIR}/node_exporter" "${BIN_DIR}/node_exporter"
   chmod +x "${BIN_DIR}/node_exporter"
-  useradd --no-create-home --shell /bin/false "$USER" || true
+  id -u "$USER" >/dev/null 2>&1 || useradd --no-create-home --shell /bin/false "$USER" || true
 
   cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -1005,100 +1758,28 @@ EOF
 node_exporter_install || warn "node_exporter install failed — continuing"
 
 ###############################################################################
-# TUNING (external)
+# DNS SWITCHER — fixed Cloudflare
 ###############################################################################
-if [[ "${RUN_TUNING}" == "1" ]]; then
-  log "Kernel/network tuning (external) — apply"
-  if curl -fsSL https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/main/initial.sh | bash -s -- apply; then
-    ok "External tuning applied"
-  else
-    warn "External tuning failed — continuing"
-  fi
-else
-  warn "Tuning skipped (--tuning=${RUN_TUNING})"
-fi
-
-###############################################################################
-# DNS SWITCHER
-###############################################################################
-if [[ "${RUN_DNS_SWITCH}" == "1" ]]; then
-  log "DNS switcher — will overwrite /etc/systemd/resolved.conf"
-
-  dns_apply_profile() {
-    local profile="${1:-}"
-    local dns="" fb=""
-
-    if [[ "$profile" == "1" ]]; then
-      echo "1"
-      return 0
-    fi
-
-    case "$profile" in
-      2) dns="8.8.8.8 8.8.4.4"; fb="9.9.9.9" ;;
-      3) dns="1.1.1.1 1.0.0.1"; fb="9.9.9.9" ;;
-      4) dns="9.9.9.9 149.112.112.112"; fb="1.1.1.1" ;;
-      5)
-        dns="${DNS_CUSTOM:-}"
-        fb="${DNS_FALLBACK:-9.9.9.9}"
-        [[ -n "$dns" ]] || { warn "dns-profile=5 requires --dns-custom"; return 1; }
-        ;;
-      *)
-        return 2
-        ;;
-    esac
-
-    local BACKUP_DIR="/etc/dns-switcher-backup"
-    mkdir -p "$BACKUP_DIR"
-    [[ -f /etc/systemd/resolved.conf ]] && cp /etc/systemd/resolved.conf "$BACKUP_DIR/resolved.conf.backup.$(date +%Y%m%d_%H%M%S)" || true
-    resolvectl status > "$BACKUP_DIR/dns_status.backup.$(date +%Y%m%d_%H%M%S)" 2>&1 || true
-
-    cat > /etc/systemd/resolved.conf <<EOF
-# Managed by DNS Switcher
-# Original configuration backed up to ${BACKUP_DIR}
+log "DNS switcher — fixed Cloudflare"
+BACKUP_DIR="/etc/dns-switcher-backup"
+mkdir -p "$BACKUP_DIR"
+[[ -f /etc/systemd/resolved.conf ]] && cp /etc/systemd/resolved.conf "$BACKUP_DIR/resolved.conf.backup.$(date +%Y%m%d_%H%M%S)" || true
+resolvectl status > "$BACKUP_DIR/dns_status.backup.$(date +%Y%m%d_%H%M%S)" 2>&1 || true
+cat > /etc/systemd/resolved.conf <<'EOF'
+# Managed by VPS bootstrap
+# DNS profile: Cloudflare
 
 [Resolve]
-DNS=${dns}
-FallbackDNS=${fb}
+DNS=1.1.1.1 1.0.0.1
+FallbackDNS=9.9.9.9 149.112.112.112
 Domains=~.
 DNSSEC=no
 DNSOverTLS=no
 Cache=yes
 EOF
-
-    systemctl restart systemd-resolved || true
-    sleep 1
-    ok "DNS switch completed. Backups saved to: ${BACKUP_DIR}"
-    return 0
-  }
-
-  if [[ -n "${DNS_PROFILE:-}" ]]; then
-    dns_apply_profile "${DNS_PROFILE}" || warn "DNS profile apply failed — continuing"
-  else
-    if ! _is_tty; then
-      dns_apply_profile "1" || true
-    else
-      echo "Choose DNS servers:"
-      echo "1) No change (echo 1)"
-      echo "2) Google only"
-      echo "3) Cloudflare only"
-      echo "4) Quad9"
-      echo "5) Custom"
-      echo
-      choice=""
-      read_tty choice "Enter choice (1-5) [default: 1]: "
-      choice="${choice:-1}"
-      if [[ "$choice" == "5" ]]; then
-        read_tty DNS_CUSTOM "Enter primary DNS servers (space-separated): "
-        read_tty DNS_FALLBACK "Enter fallback DNS server [default: 9.9.9.9]: "
-        DNS_FALLBACK="${DNS_FALLBACK:-9.9.9.9}"
-      fi
-      DNS_PROFILE="$choice"
-      dns_apply_profile "$DNS_PROFILE" || warn "DNS switcher failed — continuing"
-    fi
-  fi
-else
-  warn "DNS switcher skipped (--dns-switch=${RUN_DNS_SWITCH})"
-fi
+systemctl restart systemd-resolved || true
+sleep 1
+ok "DNS profile: Cloudflare (1.1.1.1 1.0.0.1); backups: ${BACKUP_DIR}"
 
 ###############################################################################
 # REMNANODE UP
@@ -1114,7 +1795,6 @@ fi
 # AUTOREMOVE
 ###############################################################################
 aptq "Autoremove" autoremove --purge
-ok "Automatic reboot removed from pipeline"
 
 ###############################################################################
 # FINAL REPORT
@@ -1220,19 +1900,26 @@ FWD="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo '-')"
 CTMAX="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo '-')"
 NOFILE="$(systemctl show --property DefaultLimitNOFILE 2>/dev/null | cut -d= -f2 || echo '-')"
 
-section "✅ Setup completed: $(date -Iseconds)"
+section "✅ DEPLOY SUMMARY — $(date -Iseconds)"
 
 echo "  Tailscale IPv4: ${TS_IP_NOW:-not assigned}"
 echo "  Tailscale DNS:  ${TS_DNS_NOW}"
 echo "  External IPv4:  ${EXT_IP4} ${FLAG}"
 [[ -n "${CITY}${REGION}${CC}" ]] && echo "  Location:       ${CITY}${CITY:+, }${REGION}${REGION:+, }${CC}"
 [[ -n "$ORG" ]] && echo "  Provider/ASN:   ${ORG}"
-echo "  Open ports:     ${OPEN_PORTS[*]}"
-echo "  SSH port:       ${SSH_PORT}"
-if [[ "${RUN_TAILSCALE}" == "1" ]]; then
-  echo "  SSH access:     tailscale0 only"
+if [[ "${TAILSCALE_ONLY:-0}" == "1" ]]; then
+  echo "  Open ports:     none (tailscale-only mode)"
 else
-  echo "  SSH access:     public + local"
+  echo "  Open ports:     ${OPEN_PORTS[*]}"
+fi
+echo "  SSH port:       ${SSH_PORT}"
+echo "  Timezone:       $(timedatectl show -p Timezone --value 2>/dev/null || echo unknown)"
+if [[ "${TAILSCALE_ONLY:-0}" == "1" ]]; then
+  echo "  SSH access:     tailscale0 only / public closed"
+elif printf ' %s ' "${OPEN_PORTS[@]}" | grep -q " ${SSH_PORT} "; then
+  echo "  SSH access:     public explicitly opened + tailscale0"
+else
+  echo "  SSH access:     tailscale0 only / public closed"
 fi
 echo "  PasswordAuth:   ${SSH_PASS_AUTH}"
 echo "  RootLogin:      ${SSH_ROOT_LOGIN}"
@@ -1252,6 +1939,20 @@ echo "  node_exporter:  $(emoji_service node_exporter)"
 
 section "📦 Remnanode"
 remna_status
+echo "  NODE_PORT:      ${NODE_PORT}"
+echo "  TLS domain:     ${REMNANODE_DOMAIN:-not configured}"
+echo "  Cert path:      /opt/certbot/certs/live/remnanode/fullchain.pem -> mounted as /etc/letsencrypt/live/remnanode/fullchain.pem"
+
+section "🧭 Changes applied"
+echo "  Tailscale:      ${RUN_TAILSCALE}"
+echo "  RemnaNode:      ${REMNANODE}"
+echo "  SECRET_KEY:     $([[ -n "${SECRET_KEY:-}" ]] && echo configured || echo not-configured)"
+echo "  Geo timer:      installed/enabled when RemnaNode is configured"
+echo "  RUGOV blocklist: installed with cron /etc/cron.d/update-rugov-nftables"
+echo "  Firewall:       tailscale0 allow all; public SSH closed unless explicitly opened"
+echo "  Certbot:        Docker standalone in /opt/certbot, renew via cron"
+echo "  Cert ports:     80/tcp, 443/tcp, 443/udp opened when RemnaNode/certbot is enabled"
+echo "  UFW enabled:    ${ENABLE_UFW_NOW}"
 
 section "📦 Logs"
 echo "  APT:            ${APT_LOG}"
@@ -1261,9 +1962,44 @@ echo "  Remnanode:      /var/log/remnanode"
 echo "  Rugov:          /var/log/update-rugov-nftables.log"
 echo "  Fail2ban:       /var/log/fail2ban.log"
 
+public_ip_geo_summary() {
+  local ip country city cc flag
+  ip="$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+  if [[ -n "$ip" ]]; then
+    geo_json="$(curl -fsS --max-time 5 "https://ipapi.co/${ip}/json/" 2>/dev/null || true)"
+    city="$(jq -r '.city // empty' <<<"$geo_json" 2>/dev/null || true)"
+    country="$(jq -r '.country_name // empty' <<<"$geo_json" 2>/dev/null || true)"
+    cc="$(jq -r '.country_code // empty' <<<"$geo_json" 2>/dev/null || true)"
+    flag=""
+    case "$cc" in
+      RU) flag="🇷🇺";; DE) flag="🇩🇪";; FI) flag="🇫🇮";; NL) flag="🇳🇱";; PL) flag="🇵🇱";; US) flag="🇺🇸";; TR) flag="🇹🇷";; LV) flag="🇱🇻";; SG) flag="🇸🇬";; GB) flag="🇬🇧";; FR) flag="🇫🇷";; *) flag="";;
+    esac
+    echo "  Public IPv4:    ${ip}"
+    echo "  Location:       ${flag} ${country:-unknown}${city:+ / $city}"
+  else
+    echo "  Public IPv4:    unknown"
+    echo "  Location:       unknown"
+  fi
+}
+
+tailscale_summary_bottom() {
+  local ts_ip ts_dns ts_state
+  ts_ip="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+  ts_dns="$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' 2>/dev/null || true)"
+  ts_state="$(tailscale status --json 2>/dev/null | jq -r '.BackendState // empty' 2>/dev/null || true)"
+  echo "  Tailscale IPv4: ${ts_ip:-not connected}"
+  echo "  Tailscale DNS:  ${ts_dns:-not available}"
+  echo "  Tailscale state:${ts_state:-unknown}"
+}
+
+section "🌐 Network summary"
+public_ip_geo_summary
+tailscale_summary_bottom
+
 section "🧾 System"
 sys_summary
 
-ok "Automatic reboot removed from pipeline"
+
+
 
 exit 0
