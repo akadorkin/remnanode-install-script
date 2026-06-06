@@ -1,4 +1,3 @@
-❯ cat /root/vps-edge-run-final-production-v5-clean.sh
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -1064,27 +1063,67 @@ wait_for_domain_dns() {
 }
 
 install_roscomvpn_geo_updater() {
-  log "Installing roscomvpn geo updater + 4h systemd timer"
+  log "Installing roscomvpn geo updater + daily 04:00 systemd timer"
 
   cat > /usr/local/sbin/update-roscomvpn-geo.sh <<'GEO_SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
 
 DIR="/opt/remnanode"
-GEOIP_URL="https://cdn.jsdelivr.net/gh/hydraponique/roscomvpn-geoip@202604220533/release/geoip.dat"
-GEOSITE_URL="https://cdn.jsdelivr.net/gh/hydraponique/roscomvpn-geosite@202604152235/release/geosite.dat"
+GEOIP_URL="https://cdn.jsdelivr.net/gh/hydraponique/roscomvpn-geoip/release/geoip.dat"
+GEOSITE_URL="https://cdn.jsdelivr.net/gh/hydraponique/roscomvpn-geosite/release/geosite.dat"
 
 mkdir -p "$DIR"
-cd "$DIR"
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT
 
-curl -fL --retry 3 --connect-timeout 10 -o roscomvpn-geoip.dat.tmp "$GEOIP_URL"
-curl -fL --retry 3 --connect-timeout 10 -o roscomvpn-geosite.dat.tmp "$GEOSITE_URL"
+changed=0
 
-test -s roscomvpn-geoip.dat.tmp
-test -s roscomvpn-geosite.dat.tmp
+update_dat() {
+  local url="$1"
+  local target="$2"
+  local tmp="$tmpdir/$target"
 
-mv -f roscomvpn-geoip.dat.tmp roscomvpn-geoip.dat
-mv -f roscomvpn-geosite.dat.tmp roscomvpn-geosite.dat
+  curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 120 -o "$tmp" "$url"
+  test -s "$tmp"
+
+  local new_hash
+  new_hash="$(sha256sum "$tmp" | awk '{print $1}')"
+
+  if [[ -f "$DIR/$target" ]]; then
+    local old_hash
+    old_hash="$(sha256sum "$DIR/$target" | awk '{print $1}')"
+
+    if [[ "$new_hash" == "$old_hash" ]]; then
+      echo "$target unchanged: $new_hash"
+      return 0
+    fi
+
+    echo "$target changed: $old_hash -> $new_hash"
+  else
+    echo "$target missing, installing: $new_hash"
+  fi
+
+  install -m 0644 "$tmp" "$DIR/$target"
+  changed=1
+}
+
+update_dat "$GEOIP_URL" "roscomvpn-geoip.dat"
+update_dat "$GEOSITE_URL" "roscomvpn-geosite.dat"
+
+if [[ "$changed" == "1" ]]; then
+  if docker ps --format '{{.Names}}' | grep -qx 'remnanode'; then
+    docker restart remnanode >/dev/null
+    echo "remnanode restarted after geo database update"
+  elif systemctl list-unit-files 2>/dev/null | grep -q '^xray\.service'; then
+    systemctl restart xray
+    echo "xray restarted after geo database update"
+  else
+    echo "geo databases updated, no remnanode/xray service found to restart"
+  fi
+else
+  echo "geo databases unchanged, nothing to restart"
+fi
 GEO_SCRIPT
   chmod 0755 /usr/local/sbin/update-roscomvpn-geo.sh
 
@@ -1102,12 +1141,11 @@ GEO_SERVICE
 
   cat > /etc/systemd/system/update-roscomvpn-geo.timer <<'GEO_TIMER'
 [Unit]
-Description=Run roscomvpn geo updater every 4 hours
+Description=Run roscomvpn geo updater daily at 04:00
 
 [Timer]
-OnBootSec=5min
-OnUnitActiveSec=4h
-AccuracySec=5min
+OnCalendar=*-*-* 04:00:00
+AccuracySec=1min
 Persistent=true
 Unit=update-roscomvpn-geo.service
 
