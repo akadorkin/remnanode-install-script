@@ -35,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/akadorkin/remnanode-install-script/
   --user=akadorkin \
   --tailscale=1 \
   --remnanode=1 \
-  --domain=test.proj432.co \
+  --domain=node1.example.com \
   --secret-key='PASTE_REMNANODE_SECRET_KEY_HERE' \
   --tailscale-only=1 \
   --ports=skip
@@ -175,7 +175,7 @@ curl -fsSL https://raw.githubusercontent.com/akadorkin/remnanode-install-script/
   --hostname=node-test \
   --tailscale=1 \
   --remnanode=1 \
-  --domain=test.proj432.co \
+  --domain=node1.example.com \
   --secret-key='PASTE_REMNANODE_SECRET_KEY_HERE' \
   --tailscale-only=1 \
   --ports=skip
@@ -188,7 +188,7 @@ curl -fsSL https://raw.githubusercontent.com/akadorkin/remnanode-install-script/
   --user=akadorkin \
   --tailscale=1 \
   --remnanode=1 \
-  --domain=test.proj432.co \
+  --domain=node1.example.com \
   --tailscale-only=1 \
   --ports=skip
 ```

@@ -1004,7 +1004,7 @@ prompt_remnanode_domain() {
   [[ "${REMNANODE}" == "1" ]] || return 0
 
   if [[ -z "${REMNANODE_DOMAIN:-}" && _has_tty ]]; then
-    read_tty REMNANODE_DOMAIN "Enter remnanode TLS domain for certbot (e.g. s1.proj432.co): "
+    read_tty REMNANODE_DOMAIN "Enter remnanode TLS domain for certbot (e.g. node1.example.com): "
   fi
 
   if [[ -z "${REMNANODE_DOMAIN:-}" ]]; then
@@ -1272,7 +1272,7 @@ CERTBOT_COMPOSE
     --network host \
     certbot/certbot certonly --standalone \
     --non-interactive --agree-tos \
-    --email admin@proj432.co \
+    --email admin@example.com \
     --cert-name remnanode \
     -d "${REMNANODE_DOMAIN}"
 
