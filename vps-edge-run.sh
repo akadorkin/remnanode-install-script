@@ -1272,7 +1272,7 @@ CERTBOT_COMPOSE
     --network host \
     certbot/certbot certonly --standalone \
     --non-interactive --agree-tos \
-    --email admin@example.com \
+    --register-unsafely-without-email \
     --cert-name remnanode \
     -d "${REMNANODE_DOMAIN}"
 
@@ -1375,6 +1375,7 @@ if ! command -v docker >/dev/null 2>&1; then
   runq "remove old docker keyring" rm -f /usr/share/keyrings/docker-archive-keyring.gpg
   runq "install docker gpg key" bash -lc \
     "curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --batch --yes --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg >>'$DOCKER_LOG' 2>&1"
+  runq "docker gpg key readable by apt" chmod a+r /usr/share/keyrings/docker-archive-keyring.gpg
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
     > /etc/apt/sources.list.d/docker.list
   aptq "APT update (docker)" update
