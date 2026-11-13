@@ -1,4 +1,4 @@
-# ⭐ Remnanode VPS Edge Run
+# Remnanode VPS Edge Run
 
 Production-ready **VPS bootstrap & hardening script** for running a **Remnawave / RemnaNode edge node** with secure defaults.
 
