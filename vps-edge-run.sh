@@ -94,6 +94,10 @@ PY2
   printf "Tailscale IPv4  : %s\n" "${ts_ip:-not available}"
   printf "MagicDNS        : %s\n" "${ts_dns:-not available}"
   printf "State           : %s\n" "${ts_state:-not available}"
+  if [[ "${RUN_TAILSCALE:-0}" == "1" ]]; then
+    printf "Exit node       : %s\n" "$([[ "${TS_EXIT_NODE:-1}" == "1" ]] && echo "advertised" || echo "not advertised (--exit-node=0)")"
+    printf "Tags            : %s\n" "${TS_TAGS:-none}"
+  fi
   echo
   echo "🐳 Services"
   echo "------------------------------------------------------------"
@@ -103,6 +107,8 @@ PY2
   printf "Fail2ban        : %s\n" "$(svc_icon "$fail2ban_state")"
   printf "Geo Timer       : %s\n" "$(svc_icon "$geo_timer_state")"
   printf "Node Exporter   : %s\n" "$(svc_icon "$node_exporter_state")"
+  printf "Node image      : %s\n" "$(sed -n -E 's/^[[:space:]]+image:[[:space:]]*//p' /opt/remnanode/docker-compose.yml 2>/dev/null | head -n1 | grep . || echo "n/a")"
+  printf "RUGOV blacklist : %s\n" "$([[ "${RUGOV:-0}" == "1" ]] && echo "✅ installed" || echo "⏸ not installed by this run (--rugov=0)")"
   echo
   echo "🔐 TLS"
   echo "------------------------------------------------------------"
@@ -152,9 +158,12 @@ PY2
   echo
   echo "🔄 Reboot"
   echo "------------------------------------------------------------"
-  if [[ "${DEPLOY_RESULT:-success}" == "success" ]]; then
+  if [[ "${DEPLOY_RESULT:-success}" == "success" && "${REBOOT:-1}" == "1" ]]; then
     printf "Scheduled       : %s\n" "$(date -d '+3 minutes' '+%F %T %Z' 2>/dev/null || echo 'in 3 minutes')"
     echo "Cancel command  : sudo shutdown -c"
+  elif [[ "${DEPLOY_RESULT:-success}" == "success" ]]; then
+    echo "Scheduled       : no (--reboot=0)"
+    echo "⚠ MANUAL REBOOT REQUIRED to apply kernel/limits changes: sudo reboot"
   else
     echo "Scheduled       : no, install failed"
     echo "Cancel command  : n/a"
@@ -178,7 +187,7 @@ on_exit() {
   local rc="$?"
   if [[ "$rc" == "0" ]]; then
     DEPLOY_RESULT="success"
-    schedule_final_reboot
+    if [[ "${REBOOT:-1}" == "1" ]]; then schedule_final_reboot; fi
   else
     DEPLOY_RESULT="$rc"
   fi
@@ -205,7 +214,7 @@ trap on_exit EXIT
 #   Then everything else
 #
 # Notes:
-# - Tailscale uses: tailscale up --ssh --advertise-exit-node
+# - Tailscale uses: tailscale up --ssh --advertise-exit-node (see --exit-node, --ts-tags, --ts-authkey, --ts-accept-dns)
 # - Firewall model: tailscale0 is fully open
 # - External interface opens ONLY explicit ports, plus mandatory 80/443 when Remna/certbot is enabled
 # - SSH port is fixed to 22; public SSH is NOT opened automatically
@@ -213,7 +222,8 @@ trap on_exit EXIT
 # - RemnaNode SECRET_KEY is required; it is written directly into docker-compose.yml (no .env)
 # - Timezone is always set to Europe/Moscow
 # - UFW is enabled automatically after rules are configured
-# - Reboot is scheduled automatically 3 minutes after install
+# - Reboot is scheduled automatically 3 minutes after install unless --reboot=0
+# - RUGOV nftables blacklist is installed only with --rugov=1
 ###############################################################################
 
 ###############################################################################
@@ -222,7 +232,8 @@ trap on_exit EXIT
 USER_NAME=""
 NEW_HOST=""
 TIMEZONE="Europe/Moscow"  # fixed: always applied
-REBOOT_DELAY="0"   # deprecated, ignored
+REBOOT="1"         # --reboot=0|1; legacy "--reboot <delay>" counts as 1
+RUGOV="0"          # --rugov=0|1; RUGOV nftables blacklist is opt-in
 SSH_PORT="${SSH_PORT:-22}"
 REMNANODE="0"
 PORTS_MODE=""
@@ -235,6 +246,11 @@ ORIGINAL_ARGC="$#"
 
 
 RUN_TAILSCALE="0"
+TS_AUTHKEY="${TS_AUTHKEY:-}"  # never printed
+TS_TAGS=""
+TS_EXIT_NODE="1"
+TS_ACCEPT_DNS=""   # empty = do not pass --accept-dns at all
+NODE_IMAGE=""      # empty = remnawave/node:latest for a new compose, existing compose image untouched
 DNS_PROFILE="3"  # fixed: Cloudflare
 DNS_CUSTOM=""
 DNS_FALLBACK=""
@@ -254,7 +270,11 @@ If started without options in a TTY, interactive mode asks what to install/confi
 Options:
   --user <name> | --user=<name> | user=<name>
   --secret-key <key> | --secret-key=<key> | secret_key=<key>  required for RemnaNode unless existing compose has SECRET_KEY
-  --reboot <delay> | --reboot=<delay>                (deprecated, ignored)
+  --reboot 0|1 | --reboot=0|1                        (default: 1) reboot 3 minutes after a successful install; 0/no/false = no reboot,
+                                                     reboot manually later; any other value (legacy "--reboot <delay>") counts as 1
+  --rugov 0|1 | --rugov=0|1                          (default: 0) install RUGOV nftables input-only blacklist updater + cron
+  --node-image <ref> | --node-image=<ref>            RemnaNode image, tag or digest (default: remnawave/node:latest);
+                                                     an existing compose keeps its image unless this flag is given
   --remnanode 0|1 | --remnanode=0|1                  (default: 0; Remna NODE_PORT fixed to 2222)
   --ports ask|skip | --ports=ask|skip                (default: ask if TTY, else skip)
   --open-ports "<list>" | --open-ports="<list>"      external TCP+UDP ports only; SSH is opened only if listed
@@ -262,6 +282,10 @@ Options:
   --enable-ufw-now 0|1 | --enable-ufw-now=0|1        deprecated; UFW is enabled automatically at the end
   --dns-* options are ignored; DNS is fixed to Cloudflare
   --tailscale 0|1 | --tailscale=0|1                  (default: 0)
+  --ts-authkey <key> | --ts-authkey=<key>            Tailscale auth key for login without a URL (or env TS_AUTHKEY); never printed
+  --ts-tags <tag:a,tag:b> | --ts-tags=<...>          passed to tailscale up as --advertise-tags
+  --exit-node 0|1 | --exit-node=0|1                  (default: 1) advertise this node as a Tailscale exit node
+  --ts-accept-dns 0|1 | --ts-accept-dns=0|1          (default: not passed) 0 -> tailscale up --accept-dns=false
   --domain <fqdn> | --domain=<fqdn>                    remnanode TLS domain for certbot
 EOF
 }
@@ -273,7 +297,13 @@ while [[ $# -gt 0 ]]; do
     --secret-key=*)   SECRET_KEY="${1#*=}"; shift ;;
     secret_key=*)     SECRET_KEY="${1#*=}"; shift ;;
     --timezone=*)     shift ;;  # ignored; fixed to Europe/Moscow
-    --reboot=*)       REBOOT_DELAY="${1#*=}"; shift ;;
+    --reboot=*)       REBOOT="${1#*=}"; shift ;;
+    --rugov=*)        RUGOV="${1#*=}"; shift ;;
+    --ts-authkey=*)   TS_AUTHKEY="${1#*=}"; shift ;;
+    --ts-tags=*)      TS_TAGS="${1#*=}"; shift ;;
+    --exit-node=*)    TS_EXIT_NODE="${1#*=}"; shift ;;
+    --ts-accept-dns=*) TS_ACCEPT_DNS="${1#*=}"; shift ;;
+    --node-image=*)   NODE_IMAGE="${1#*=}"; shift ;;
     --remnanode=*)    REMNANODE="${1#*=}"; shift ;;
     --ssh-port=*)     shift ;;  # ignored; fixed to 22
     --ports=*)        PORTS_MODE="${1#*=}"; shift ;;
@@ -293,7 +323,13 @@ while [[ $# -gt 0 ]]; do
     --user)         USER_NAME="${2:-}"; shift 2 ;;
     --secret-key)   SECRET_KEY="${2:-}"; shift 2 ;;
     --timezone)     shift 2 ;;  # ignored; fixed to Europe/Moscow
-    --reboot)       REBOOT_DELAY="${2:-0}"; shift 2 ;;
+    --reboot)       REBOOT="${2:-1}"; shift 2 ;;
+    --rugov)        RUGOV="${2:-0}"; shift 2 ;;
+    --ts-authkey)   TS_AUTHKEY="${2:-}"; shift 2 ;;
+    --ts-tags)      TS_TAGS="${2:-}"; shift 2 ;;
+    --exit-node)    TS_EXIT_NODE="${2:-1}"; shift 2 ;;
+    --ts-accept-dns) TS_ACCEPT_DNS="${2:-}"; shift 2 ;;
+    --node-image)   NODE_IMAGE="${2:-}"; shift 2 ;;
     --remnanode)    REMNANODE="${2:-0}"; shift 2 ;;
     --ssh-port)     shift 2 ;;  # ignored; fixed to 22
     --ports)        PORTS_MODE="${2:-}"; shift 2 ;;
@@ -311,10 +347,29 @@ while [[ $# -gt 0 ]]; do
 
     --tailscale-only) TAILSCALE_ONLY="1"; shift ;;
     --enable-ufw-now) ENABLE_UFW_NOW="1"; shift ;;
-    -h|--help) usage; exit 0 ;;
+    -h|--help) trap - EXIT; usage; exit 0 ;;
     *) echo "Unknown arg: $1"; usage; exit 1 ;;
   esac
 done
+
+# Normalize 0|1 flags. Legacy "--reboot <delay>": anything but 0/no/false means reboot.
+norm_bool() {  # $1=value $2=default -> prints 0 or 1
+  case "${1,,}" in
+    0|no|false|off) echo 0 ;;
+    1|yes|true|on)  echo 1 ;;
+    *)              echo "$2" ;;
+  esac
+}
+case "${REBOOT,,}" in 0|no|false) REBOOT="0" ;; *) REBOOT="1" ;; esac
+RUGOV="$(norm_bool "$RUGOV" 0)"
+TS_EXIT_NODE="$(norm_bool "$TS_EXIT_NODE" 1)"
+[[ -z "$TS_ACCEPT_DNS" ]] || TS_ACCEPT_DNS="$(norm_bool "$TS_ACCEPT_DNS" "")"
+if [[ -n "$TS_TAGS" && ! "$TS_TAGS" =~ ^tag:[A-Za-z0-9_-]+(,tag:[A-Za-z0-9_-]+)*$ ]]; then
+  echo "Invalid --ts-tags (expected tag:a,tag:b): $TS_TAGS"; exit 1
+fi
+if [[ -n "$NODE_IMAGE" && ! "$NODE_IMAGE" =~ ^[A-Za-z0-9][A-Za-z0-9._/:@-]*$ ]]; then
+  echo "Invalid --node-image: $NODE_IMAGE"; exit 1
+fi
 
 SSH_PORT="22"  # fixed: never changed interactively
 RUN_TUNING="1" # fixed: always enabled
@@ -601,12 +656,27 @@ ensure_tailscale_up() {
   fi
 
   ok "Tailscale installed, but this node is not authorized yet"
-  log "Running tailscale up --ssh --advertise-exit-node"
+
+  local up_args=(--ssh) keyfile=""
+  if [[ "${TS_EXIT_NODE}" == "1" ]]; then up_args+=(--advertise-exit-node); fi
+  if [[ -n "${TS_TAGS}" ]]; then up_args+=("--advertise-tags=${TS_TAGS}"); fi
+  if [[ -n "${TS_ACCEPT_DNS}" ]]; then
+    up_args+=("--accept-dns=$([[ "${TS_ACCEPT_DNS}" == "1" ]] && echo true || echo false)")
+  fi
+  log "Running tailscale up ${up_args[*]}$([[ -n "${TS_AUTHKEY}" ]] && echo ' --auth-key=<hidden>')"
+  if [[ -n "${TS_AUTHKEY}" ]]; then
+    # key goes through a root-only file so it shows up neither in the process list nor in logs
+    keyfile="$(mktemp)"
+    chmod 600 "$keyfile"
+    printf '%s' "${TS_AUTHKEY}" > "$keyfile"
+    up_args+=("--auth-key=file:${keyfile}")
+  fi
 
   set +e
-  tailscale up --ssh --advertise-exit-node 2>&1 | tee /tmp/tailscale-up.log
+  tailscale up "${up_args[@]}" 2>&1 | tee /tmp/tailscale-up.log
   local rc=${PIPESTATUS[0]}
   set -e
+  if [[ -n "$keyfile" ]]; then rm -f "$keyfile"; fi
 
   local url=""
   url="$(grep -Eo 'https://login\.tailscale\.com/[a-zA-Z0-9/_-]+' /tmp/tailscale-up.log | head -n1 || true)"
@@ -618,7 +688,7 @@ ensure_tailscale_up() {
     warn "tailscale up returned rc=$rc. If authorization URL was shown, authorize and continue."
   fi
 
-  if _has_tty; then
+  if [[ -z "${TS_AUTHKEY}" ]] && _has_tty; then
     local _=""
     read_tty _ "Press Enter after authorizing this device in Tailscale..."
   fi
@@ -827,6 +897,9 @@ interactive_defaults() {
   fi
 
   ask_yes_no RUN_TAILSCALE "Install/configure Tailscale" "y"
+  if [[ "${RUN_TAILSCALE}" == "1" ]]; then
+    ask_yes_no TS_EXIT_NODE "Advertise this node as a Tailscale exit node" "y"
+  fi
   ask_yes_no REMNANODE "Install/configure RemnaNode stack" "y"
 
   if [[ "${REMNANODE}" == "1" ]]; then
@@ -880,12 +953,20 @@ interactive_defaults() {
   esac
 
 
+  ask_yes_no RUGOV "Install RUGOV nftables input blacklist" "n"
+  ask_yes_no REBOOT "Reboot automatically when finished" "y"
+
   echo ""
   section "Configuration summary"
   echo "  Hostname:      ${NEW_HOST:-<keep current>}"
   echo "  User:          ${USER_NAME:-<skip>}"
   echo "  Tailscale:     ${RUN_TAILSCALE}"
+  echo "  TS exit node:  ${TS_EXIT_NODE}"
+  echo "  TS tags:       ${TS_TAGS:-<none>}"
+  echo "  TS auth key:   $([[ -n "${TS_AUTHKEY:-}" ]] && echo configured || echo "not-configured (login URL)")"
+  echo "  TS accept-dns: ${TS_ACCEPT_DNS:-<tailscale default>}"
   echo "  RemnaNode:     ${REMNANODE}"
+  echo "  Node image:    ${NODE_IMAGE:-<remnawave/node:latest, existing compose untouched>}"
   echo "  Remna port:    2222"
   echo "  Domain:        ${REMNANODE_DOMAIN:-<none>}"
   echo "  SECRET_KEY:    $([[ -n "${SECRET_KEY:-}" ]] && echo configured || echo not-configured)"
@@ -893,6 +974,8 @@ interactive_defaults() {
   echo "  DNS profile:   Cloudflare"
   echo "  Firewall:      $([[ "${TAILSCALE_ONLY}" == "1" ]] && echo tailscale-only || echo selected-public-ports)"
   echo "  Open ports:    ${OPEN_PORTS_RAW:-<none>}"
+  echo "  RUGOV:         ${RUGOV}"
+  echo "  Reboot:        ${REBOOT}"
 
   ask_yes_no __confirm "Continue" "y"
   [[ "$__confirm" == "1" ]] || { echo "Aborted"; exit 1; }
@@ -913,7 +996,7 @@ export NEEDRESTART_MODE=a
 log "Timezone: Europe/Moscow"
 runq "set timezone Europe/Moscow" timedatectl set-timezone Europe/Moscow || warn "Failed to set timezone — continuing"
 
-log "Parameters: user='${USER_NAME:-<skip>}' remnanode='${REMNANODE}' remna_port='2222' ssh_port='22' timezone='Europe/Moscow' tuning='always' dns-switch='1' dns-profile='Cloudflare' tailscale='${RUN_TAILSCALE}'"
+log "Parameters: user='${USER_NAME:-<skip>}' remnanode='${REMNANODE}' remna_port='2222' ssh_port='22' timezone='Europe/Moscow' tuning='always' dns-switch='1' dns-profile='Cloudflare' tailscale='${RUN_TAILSCALE}' exit-node='${TS_EXIT_NODE}' ts-tags='${TS_TAGS:-<none>}' ts-authkey='$([[ -n "${TS_AUTHKEY}" ]] && echo set || echo unset)' ts-accept-dns='${TS_ACCEPT_DNS:-<default>}' node-image='${NODE_IMAGE:-<default>}' rugov='${RUGOV}' reboot='${REBOOT}'"
 
 if [[ -n "${USER_NAME:-}" ]]; then
   ok "User: $USER_NAME"
@@ -1067,63 +1150,146 @@ install_roscomvpn_geo_updater() {
 
   cat > /usr/local/sbin/update-roscomvpn-geo.sh <<'GEO_SCRIPT'
 #!/usr/bin/env bash
-set -euo pipefail
+# update-roscomvpn-geo: refresh roscomvpn geoip/geosite without dropping clients every night.
+#
+# Upstream publishes a new geoip file every day. Restarting remnanode on every change
+# disconnects all clients nightly, even on nodes whose Xray config never references these files.
+#
+# Logic:
+#   1. download both files (one failing does not block the other);
+#   2. validate: size >= 10 KB and >= 50% of the current file, plus `rw-core -test` inside
+#      the container on the categories the running Xray config really uses;
+#   3. write into the SAME inode: the files are bind-mounted one by one, so a replaced
+#      inode stays invisible to the container until the container is recreated;
+#   4. restart remnanode only if a changed file is referenced by the running Xray config
+#      AND the container has been up for at least RESTART_MIN_DAYS (a file that did not
+#      exist before is applied at once). Otherwise the restart is deferred ($STATE/pending)
+#      and the files take effect on the next restart, whatever causes it.
+#      If the running config cannot be read, nothing is restarted.
+#
+# Optional settings in /etc/default/update-roscomvpn-geo:
+#   RESTART_MIN_DAYS=3
+#   REMNA_PANEL_URLS="https://panel.example.com/"  # restart only while the panel answers:
+#                                                  # Xray does not start without a config from the panel
+# DRY=1 prints the decisions and changes nothing.
+set -uo pipefail
 
-DIR="/opt/remnanode"
-GEOIP_URL="https://cdn.jsdelivr.net/gh/hydraponique/roscomvpn-geoip/release/geoip.dat"
-GEOSITE_URL="https://cdn.jsdelivr.net/gh/hydraponique/roscomvpn-geosite/release/geosite.dat"
+DIR="${GEO_DIR:-/opt/remnanode}"
+STATE="${GEO_STATE_DIR:-/var/lib/roscomvpn-geo}"
+RESTART_MIN_DAYS="${RESTART_MIN_DAYS:-3}"
+PANEL_URLS="${REMNA_PANEL_URLS:-}"
+WAIT_S="${REMNA_RESTART_WAIT_S:-120}"
+DRY="${DRY:-0}"
+declare -A URL=(
+  [roscomvpn-geoip.dat]="https://cdn.jsdelivr.net/gh/hydraponique/roscomvpn-geoip/release/geoip.dat"
+  [roscomvpn-geosite.dat]="https://cdn.jsdelivr.net/gh/hydraponique/roscomvpn-geosite/release/geosite.dat"
+)
+declare -A KIND=([roscomvpn-geoip.dat]=ip [roscomvpn-geosite.dat]=domain)
 
-mkdir -p "$DIR"
-tmpdir="$(mktemp -d)"
-trap 'rm -rf "$tmpdir"' EXIT
+log() { echo "$*"; }
+mkdir -p "$STATE" "$DIR"
+exec 9>"$STATE/lock"
+flock -n 9 || { log "already running"; exit 0; }
+tmpdir="$(mktemp -d)"; trap 'rm -rf "$tmpdir"' EXIT
 
-changed=0
+have_node=0
+docker ps --format '{{.Names}}' 2>/dev/null | grep -qx remnanode && have_node=1
 
-update_dat() {
-  local url="$1"
-  local target="$2"
-  local tmp="$tmpdir/$target"
-
-  curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 120 -o "$tmp" "$url"
-  test -s "$tmp"
-
-  local new_hash
-  new_hash="$(sha256sum "$tmp" | awk '{print $1}')"
-
-  if [[ -f "$DIR/$target" ]]; then
-    local old_hash
-    old_hash="$(sha256sum "$DIR/$target" | awk '{print $1}')"
-
-    if [[ "$new_hash" == "$old_hash" ]]; then
-      echo "$target unchanged: $new_hash"
-      return 0
+# --- running Xray config: which files and categories this node really needs ---
+cfg_ok=0
+if [[ $have_node == 1 ]]; then
+  pid="$(pgrep -x rw-core | head -1 || true)"
+  if [[ -n "$pid" ]]; then
+    args="$(tr '\0' '\n' < "/proc/$pid/cmdline")"
+    sock="$(grep -o '^@[^:]*' <<<"$args" | head -1 | cut -c2-)"
+    path="$(grep -o ':/internal[^ ]*' <<<"$args" | head -1 | cut -c2-)"
+    if [[ -n "$sock" && -n "$path" ]] && curl -s -m 15 --abstract-unix-socket "$sock" "http://localhost$path" -o "$tmpdir/running.json" && test -s "$tmpdir/running.json"; then
+      cfg_ok=1
     fi
-
-    echo "$target changed: $old_hash -> $new_hash"
-  else
-    echo "$target missing, installing: $new_hash"
   fi
+fi
+uses() { [[ $cfg_ok == 1 ]] && grep -q "ext:$1:" "$tmpdir/running.json"; }
+cats() { grep -o "ext:$1:[A-Za-z0-9_.!-]*" "$tmpdir/running.json" 2>/dev/null | cut -d: -f3 | sed 's/^!//' | sort -u; }
 
-  install -m 0644 "$tmp" "$DIR/$target"
-  changed=1
+validate() {  # $1=name, $2=downloaded file
+  local f="$1" new="$2" sz old rc
+  sz=$(stat -c %s "$new"); (( sz >= 10000 )) || { log "$f: too small ($sz B)"; return 1; }
+  if [[ -f "$DIR/$f" ]]; then old=$(stat -c %s "$DIR/$f"); (( sz * 2 >= old )) || { log "$f: shrank $old -> $sz B"; return 1; }; fi
+  [[ $have_node == 1 ]] || return 0
+  # image without rw-core: size checks only
+  docker exec remnanode sh -c 'command -v rw-core' >/dev/null 2>&1 || return 0
+  local c list; list="$(cats "$f")"; [[ -n "$list" ]] || list="$( [[ ${KIND[$f]} == ip ]] && echo private || echo category-ru )"
+  local rules="" k="${KIND[$f]}"
+  for c in $list; do rules+="{\"type\":\"field\",\"$k\":[\"ext:$f:$c\"],\"outboundTag\":\"d\"},"; done
+  printf '{"log":{"loglevel":"none"},"outbounds":[{"tag":"d","protocol":"freedom"}],"routing":{"rules":[%s]}}' "${rules%,}" > "$tmpdir/t.json"
+  docker exec remnanode mkdir -p /tmp/geotest >/dev/null 2>&1
+  docker cp -q "$new" "remnanode:/tmp/geotest/$f" && docker cp -q "$tmpdir/t.json" remnanode:/tmp/geotest/t.json || { log "$f: docker cp failed"; return 1; }
+  if docker exec -e XRAY_LOCATION_ASSET=/tmp/geotest remnanode rw-core -test -config /tmp/geotest/t.json >"$tmpdir/test.log" 2>&1; then rc=0; else rc=1; fi
+  docker exec remnanode rm -rf /tmp/geotest >/dev/null 2>&1
+  [[ $rc == 0 ]] || { log "$f: rw-core -test failed: $(tail -1 "$tmpdir/test.log")"; return 1; }
 }
 
-update_dat "$GEOIP_URL" "roscomvpn-geoip.dat"
-update_dat "$GEOSITE_URL" "roscomvpn-geosite.dat"
-
-if [[ "$changed" == "1" ]]; then
-  if docker ps --format '{{.Names}}' | grep -qx 'remnanode'; then
-    docker restart remnanode >/dev/null
-    echo "remnanode restarted after geo database update"
-  elif systemctl list-unit-files 2>/dev/null | grep -q '^xray\.service'; then
-    systemctl restart xray
-    echo "xray restarted after geo database update"
-  else
-    echo "geo databases updated, no remnanode/xray service found to restart"
+# 0 = restarted and Xray is up; 3 = skipped, panel unreachable; 4 = restarted but Xray did not come up
+safe_restart() {
+  local u code up=0 i
+  if [[ -n "$PANEL_URLS" ]]; then
+    for u in $PANEL_URLS; do
+      code="$(curl -sk -m 10 -o /dev/null -w '%{http_code}' "$u" 2>/dev/null)"
+      if [[ "$code" =~ ^[234] ]]; then up=1; break; fi
+    done
+    [[ $up == 1 ]] || { log "panel unreachable — remnanode not restarted"; return 3; }
   fi
-else
-  echo "geo databases unchanged, nothing to restart"
+  docker restart remnanode >/dev/null || return 4
+  for ((i=0; i<WAIT_S; i+=5)); do
+    sleep 5
+    docker top remnanode -eo pid,comm 2>/dev/null | awk '{print $2}' | grep -qx rw-core && return 0
+  done
+  log "remnanode restarted, but Xray did not come up within ${WAIT_S}s"
+  return 4
+}
+
+need_restart=0; urgent=0; changed_list=""
+for f in "${!URL[@]}"; do
+  if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 120 -o "$tmpdir/$f" "${URL[$f]}"; then
+    log "$f: download failed"; continue
+  fi
+  nh=$(sha256sum "$tmpdir/$f" | cut -c1-64)
+  oh=$( [[ -f "$DIR/$f" ]] && sha256sum "$DIR/$f" | cut -c1-64 || echo none )
+  [[ "$nh" == "$oh" ]] && { log "$f unchanged"; continue; }
+  validate "$f" "$tmpdir/$f" || continue
+  log "$f changed: ${oh:0:12} -> ${nh:0:12} (used by running config: $(uses "$f" && echo yes || echo no))"
+  # same inode, see header; Xray reads these files only at start, so an in-place write is safe
+  if [[ $DRY != 1 ]]; then
+    cat "$tmpdir/$f" > "$DIR/$f" && chmod 0644 "$DIR/$f" && cmp -s "$tmpdir/$f" "$DIR/$f" || { log "$f: write failed"; continue; }
+  fi
+  changed_list+="$f "
+  if uses "$f"; then need_restart=1; [[ "$oh" == none ]] && urgent=1; fi
+done
+
+now=$(date +%s); last=0
+if [[ $have_node == 1 ]]; then st="$(docker inspect -f '{{.State.StartedAt}}' remnanode 2>/dev/null)"; last=$(date -d "$st" +%s 2>/dev/null || echo 0); fi
+age_days=$(( (now - last) / 86400 ))
+# deferred earlier: $STATE/pending is set when a restart is postponed and cleared as soon as
+# the container has been restarted after it, for any reason
+PEND="$STATE/pending"
+if [[ -f "$PEND" ]]; then
+  if (( last >= $(stat -c %Y "$PEND") )); then rm -f "$PEND"; log "pending cleared: remnanode restarted since"
+  elif [[ $cfg_ok == 1 ]] && { uses roscomvpn-geoip.dat || uses roscomvpn-geosite.dat; }; then need_restart=1; log "pending update from $(date -r "$PEND" +%F)"; fi
 fi
+decision="none"
+if [[ $have_node == 1 && $cfg_ok == 0 && -n "$changed_list" ]]; then
+  decision="skip-no-config"; log "WARN: running config unreadable — files installed, they take effect on the next restart"
+elif [[ $need_restart == 1 ]]; then
+  if [[ $urgent == 1 || $age_days -ge $RESTART_MIN_DAYS ]]; then decision="restart"; else decision="deferred"; fi
+fi
+case $decision in
+  restart)  if [[ $DRY == 1 ]]; then log "DRY: would restart remnanode"
+            elif safe_restart; then rm -f "$PEND"; log "remnanode restarted"
+            else rc=$?; touch "$PEND"; log "restart not done (rc=$rc) — pending, retry on the next run"; fi ;;
+  deferred) [[ $DRY == 1 || -f "$PEND" ]] || touch "$PEND"; log "restart deferred: remnanode up ${age_days}d (< ${RESTART_MIN_DAYS}d); files apply on the next restart" ;;
+  *)        log "no restart needed (changed: ${changed_list:-nothing})" ;;
+esac
+exit 0
 GEO_SCRIPT
   chmod 0755 /usr/local/sbin/update-roscomvpn-geo.sh
 
@@ -1135,6 +1301,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+EnvironmentFile=-/etc/default/update-roscomvpn-geo
 ExecStart=/usr/local/sbin/update-roscomvpn-geo.sh
 GEO_SERVICE
   chmod 0644 /etc/systemd/system/update-roscomvpn-geo.service
@@ -1236,6 +1403,24 @@ COMPOSE_ENV_PY
 
   docker compose -f "$compose" config >/dev/null
   ok "Compose environment normalized: NODE_PORT=${NODE_PORT}, SECRET_KEY=<configured>"
+}
+
+normalize_remnanode_compose_image() {
+  local compose="/opt/remnanode/docker-compose.yml"
+  [[ -n "${NODE_IMAGE:-}" ]] || return 0   # no --node-image: keep whatever the compose has
+  [[ -f "$compose" ]] || return 0
+
+  local current=""
+  current="$(sed -n -E 's/^[[:space:]]+image:[[:space:]]*//p' "$compose" | head -n1)"
+  if [[ "$current" == "${NODE_IMAGE}" ]]; then
+    ok "Compose image already ${NODE_IMAGE}"
+    return 0
+  fi
+
+  # NODE_IMAGE is validated at arg parsing ([A-Za-z0-9._/:@-]), so it is safe inside the sed replacement
+  sed -i -E "0,/^([[:space:]]+image:[[:space:]]*).*/s||\\1${NODE_IMAGE}|" "$compose"
+  docker compose -f "$compose" config >/dev/null
+  ok "Compose image: ${current:-<none>} -> ${NODE_IMAGE}"
 }
 
 issue_remnanode_certificate() {
@@ -1496,7 +1681,7 @@ services:
   remnanode:
     container_name: remnanode
     hostname: remnanode
-    image: remnawave/node:latest
+    image: ${NODE_IMAGE:-remnawave/node:latest}
     network_mode: host
     cap_add:
       - NET_ADMIN
@@ -1524,6 +1709,7 @@ fi
 if [[ -f "${REMNA_COMPOSE}" ]]; then
   normalize_remnanode_compose_environment
   normalize_remnanode_compose_volumes
+  normalize_remnanode_compose_image
   install_roscomvpn_geo_updater
   wait_for_domain_dns
   issue_remnanode_certificate
@@ -1617,6 +1803,7 @@ runq "restart fail2ban" systemctl restart fail2ban
 ###############################################################################
 # RUGOV nftables blacklist (input-only) + cron + logrotate
 ###############################################################################
+if [[ "${RUGOV}" == "1" ]]; then
 log "Installing rugov nftables input-only blacklist updater"
 
 cat > /usr/local/sbin/update-rugov-nftables <<'EOF'
@@ -1681,6 +1868,9 @@ EOF
 chmod 0644 /etc/logrotate.d/update-rugov-nftables
 
 runq "apply rugov nftables now" bash -lc '/usr/local/sbin/update-rugov-nftables >> /var/log/update-rugov-nftables.log 2>&1'
+else
+  warn "RUGOV nftables blacklist skipped (--rugov=0); an already installed one is left as is"
+fi
 
 ###############################################################################
 # UFW
