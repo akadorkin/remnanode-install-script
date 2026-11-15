@@ -11,7 +11,8 @@ The current default model is:
 - `tailscale0` is fully trusted and allowed.
 - Public ports are limited to `80/tcp`, `443/tcp`, `443/udp` for certificate issuance and public TLS/QUIC entry.
 - UFW is enabled automatically at the end of the install.
-- A reboot is scheduled automatically 3 minutes after successful install.
+- A reboot is scheduled automatically 3 minutes after successful install (disable with `--reboot=0`).
+- The RUGOV nftables blacklist is **not** installed unless you pass `--rugov=1`.
 
 > **No warranty.** Run this only on servers where you have root access and console/Tailscale recovery available.
 
@@ -56,21 +57,21 @@ curl -fsSL https://raw.githubusercontent.com/akadorkin/remnanode-install-script/
 
 1. Sets timezone to `Europe/Moscow`.
 2. Optionally sets hostname.
-3. Optionally installs and authorizes Tailscale with `tailscale up --ssh --advertise-exit-node`.
+3. Optionally installs and authorizes Tailscale with `tailscale up --ssh --advertise-exit-node` (auth key, tags, exit node and accept-dns are configurable).
 4. Installs base packages, Docker CE, Fail2ban, HAProxy, UFW, cron, jq, dnsutils, etc.
 5. Applies external kernel/network tuning.
 6. Creates/updates sudo user and Zsh environment.
 7. Hardens SSH: `PermitRootLogin no`, `PasswordAuthentication no`, SSH port fixed to `22`.
 8. Creates or normalizes `/opt/remnanode/docker-compose.yml` when RemnaNode is enabled.
-9. Installs roscomvpn geo updater with a 4-hour systemd timer.
+9. Installs roscomvpn geo updater with a daily 04:00 systemd timer (see [Geo files updater](#geo-files-updater)).
 10. Issues/renews TLS certificate with Docker certbot into `/opt/certbot/certs`.
 11. Installs Fail2ban jails: `sshd`, `sshd-fast`, `recidive`.
-12. Installs RUGOV nftables input-only blacklist updater.
+12. Optional, off by default (`--rugov=1`): RUGOV nftables input-only blacklist updater.
 13. Configures UFW rules and enables UFW at the end.
 14. Installs `node_exporter`.
 15. Forces Cloudflare DNS via `systemd-resolved`.
 16. Starts RemnaNode via Docker Compose.
-17. Prints final summary and schedules reboot in 3 minutes.
+17. Prints final summary and schedules reboot in 3 minutes (optional: `--reboot=0` skips it and the summary asks for a manual reboot).
 
 ---
 
@@ -114,7 +115,8 @@ This means SSH, RemnaNode API, metrics, and internal service access should be do
 
 - `--user <name>` / `--user=<name>` / `user=<name>` — create or update sudo user.
 - `--hostname <name>` / `--hostname=<name>` — set hostname.
-- `--reboot` — deprecated; reboot is scheduled automatically after successful install.
+- `--reboot 0|1` / `--reboot=0|1` — default `1`: reboot 3 minutes after successful install. `0`, `no` or `false` skips the reboot; reboot manually later. Any other value (legacy `--reboot <delay>`) counts as `1`.
+- `--rugov 0|1` / `--rugov=0|1` — default `0`. `1` installs the RUGOV nftables input-only blacklist updater, its cron job and logrotate. With `0` nothing is installed; a blacklist installed by an earlier run is left as is.
 - `--timezone` — ignored; timezone is fixed to `Europe/Moscow`.
 - `--ssh-port` — ignored; SSH port is fixed to `22`.
 
@@ -123,6 +125,7 @@ This means SSH, RemnaNode API, metrics, and internal service access should be do
 - `--remnanode 0|1` / `--remnanode=0|1` — enable RemnaNode setup.
 - `--domain <fqdn>` / `--domain=<fqdn>` — domain for certbot TLS certificate.
 - `--secret-key <key>` / `--secret-key=<key>` / `secret_key=<key>` — RemnaNode `SECRET_KEY`.
+- `--node-image <ref>` / `--node-image=<ref>` — RemnaNode image, e.g. a pinned tag or digest. Default for a new compose: `remnawave/node:latest`. An existing compose keeps its image unless this flag is given.
 
 RemnaNode defaults:
 
@@ -134,14 +137,18 @@ RemnaNode defaults:
 ### Tailscale
 
 - `--tailscale 0|1` / `--tailscale=0|1` — install/configure Tailscale.
+- `--ts-authkey <key>` / `--ts-authkey=<key>` or env `TS_AUTHKEY` — log in with an auth key instead of the login URL; no "press Enter" prompt. The key is passed to Tailscale through a root-only temporary file and is never printed in the log or summary.
+- `--ts-tags <tag:a,tag:b>` / `--ts-tags=<...>` — passed as `--advertise-tags`.
+- `--exit-node 0|1` / `--exit-node=0|1` — default `1`. `0` drops `--advertise-exit-node`.
+- `--ts-accept-dns 0|1` / `--ts-accept-dns=0|1` — not passed by default (Tailscale default applies). `0` adds `--accept-dns=false`, `1` adds `--accept-dns=true`.
 
-When enabled, the script installs Tailscale if missing and runs:
+When enabled, the script installs Tailscale if missing and by default runs:
 
 ```bash
 tailscale up --ssh --advertise-exit-node
 ```
 
-If the node is already authorized, it does not re-run authorization.
+If the node is already authorized, it does not re-run `tailscale up`, so the flags above are not applied to it.
 
 ### Ports / firewall
 
@@ -193,6 +200,29 @@ curl -fsSL https://raw.githubusercontent.com/akadorkin/remnanode-install-script/
   --ports=skip
 ```
 
+### Unattended / fleet use
+
+No questions asked: Tailscale login by auth key, tagged node, no exit node, no RUGOV, no automatic reboot, pinned node image.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/akadorkin/remnanode-install-script/refs/heads/main/vps-edge-run.sh | sudo bash -s -- \
+  --hostname=node1 \
+  --tailscale=1 \
+  --ts-authkey=tskey-XXXX \
+  --ts-tags=tag:edge \
+  --exit-node=0 \
+  --remnanode=1 \
+  --domain=node1.example.com \
+  --secret-key='PASTE_REMNANODE_SECRET_KEY_HERE' \
+  --node-image=remnawave/node:X.Y.Z \
+  --tailscale-only=1 \
+  --ports=skip \
+  --rugov=0 \
+  --reboot=0
+```
+
+`TS_AUTHKEY=tskey-XXXX` in the environment works instead of `--ts-authkey` and keeps the key out of the shell history. With `--reboot=0`, reboot the server yourself when convenient.
+
 ### Base hardening only
 
 ```bash
@@ -216,8 +246,13 @@ echo && echo "=== REMNANODE ===" && docker ps --format 'table {{.Names}}\t{{.Sta
 echo && echo "=== CERT ===" && openssl x509 -in /opt/certbot/certs/live/remnanode/fullchain.pem -noout -subject -enddate && \
 echo && echo "=== PORTS ===" && ss -lntup | grep -E ':80 |:443 |:2222 |:5443 |:5444 |:9100 ' || true && \
 echo && echo "=== GEO ===" && systemctl is-active update-roscomvpn-geo.timer && \
-echo && echo "=== RUGOV ===" && grep -R update-rugov-nftables /etc/cron.d && nft list ruleset | grep -i -A8 -B5 'blacklist_v4\|rugov_input' && \
 echo && echo "=== FIREWALL ===" && ufw status numbered
+```
+
+Only with `--rugov=1`:
+
+```bash
+grep -R update-rugov-nftables /etc/cron.d && nft list ruleset | grep -i -A8 -B5 'blacklist_v4\|rugov_input'
 ```
 
 Expected essentials:
@@ -239,13 +274,34 @@ Expected essentials:
 - Certbot compose: `/opt/certbot/docker-compose.yml`
 - Certificates: `/opt/certbot/certs/live/remnanode/`
 - Geo files: `/opt/remnanode/roscomvpn-*.dat`
-- RUGOV updater: `/usr/local/sbin/update-rugov-nftables`
-- RUGOV cron: `/etc/cron.d/update-rugov-nftables`
+- Geo updater: `/usr/local/sbin/update-roscomvpn-geo.sh`, settings: `/etc/default/update-roscomvpn-geo`, state: `/var/lib/roscomvpn-geo/`
+- RUGOV updater (`--rugov=1`): `/usr/local/sbin/update-rugov-nftables`
+- RUGOV cron (`--rugov=1`): `/etc/cron.d/update-rugov-nftables`
 - APT log: `/var/log/initial-apt.log`
 - Docker install log: `/var/log/install-docker.log`
 - Tailscale install log: `/var/log/install-tailscale.log`
-- RUGOV log: `/var/log/update-rugov-nftables.log`
+- RUGOV log (`--rugov=1`): `/var/log/update-rugov-nftables.log`
 - Fail2ban log: `/var/log/fail2ban.log`
+
+---
+
+## Geo files updater
+
+`update-roscomvpn-geo.sh` runs daily at 04:00. Upstream publishes new files every day, so the updater does **not** restart RemnaNode on every change:
+
+- downloaded files are validated (size, and `rw-core -test` inside the container) and written in place, into the same inode, so the bind-mounted files stay visible to the container;
+- RemnaNode is restarted only if a changed file is referenced by the running Xray config (`ext:roscomvpn-geoip.dat:...` / `ext:roscomvpn-geosite.dat:...`) and the container has been up for at least 3 days; otherwise the new files take effect on the next restart;
+- if the running config cannot be read, nothing is restarted.
+
+Optional settings in `/etc/default/update-roscomvpn-geo`:
+
+```bash
+RESTART_MIN_DAYS=3
+# restart only while the panel answers; Xray does not start without a config from the panel
+REMNA_PANEL_URLS="https://panel.example.com/"
+```
+
+Dry run: `sudo DRY=1 /usr/local/sbin/update-roscomvpn-geo.sh`.
 
 ---
 
